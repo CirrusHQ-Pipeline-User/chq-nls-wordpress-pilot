@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Edge protection tier. Regional AWS WAF web ACL (per-IP rate limiting plus AWS
+  managed rule groups) associated with the Application Load Balancer, with
+  optional logging to CloudWatch Logs.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+  LoadBalancerArn:
+    Type: String
+  RateLimit:
+    Type: Number
+    Default: 2000
+  IncludeSqliRules:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  HasSqliRules: !Equals [!Ref IncludeSqliRules, 'true']
+  HasLogging: !Equals [!Ref EnableLogging, 'true']
+
+Resources:
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${EnvironmentName}-web-acl'
+      Description: !Sub 'Protects the ${EnvironmentName} application load balancer'
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${EnvironmentName}-web-acl'
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimit
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+        - Name: AWS-AWSManagedRulesAmazonIpReputationList
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAmazonIpReputationList
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+        - Name: AWS-AWSManagedRulesLinuxRuleSet
+          Priority: 4
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesLinuxRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesLinuxRuleSet
+        - !If
+          - HasSqliRules
+          - Name: AWS-AWSManagedRulesSQLiRuleSet
+            Priority: 5
+            OverrideAction: { None: {} }
+            Statement:
+              ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet }
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: AWSManagedRulesSQLiRuleSet
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Name, Value: !Sub '${EnvironmentName}-web-acl' }
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancerArn
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # WAF requires the log group name to start with "aws-waf-logs-".
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasLogging
+    Properties:
+      LogGroupName: !Sub 'aws-waf-logs-${EnvironmentName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: HasLogging
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}'
+      RedactedFields:
+        - SingleHeader: { Name: authorization }
+        - SingleHeader: { Name: cookie }
+
+Outputs:
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn
+  WebAclId:
+    Value: !GetAtt WebAcl.Id

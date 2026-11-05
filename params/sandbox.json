@@ -1,0 +1,49 @@
+{
+  "StackName": "nls-sandbox",
+  "Region": "eu-west-2",
+  "Tags": {
+    "Project": "NLS",
+    "Environment": "sandbox",
+    "ManagedBy": "CloudFormation"
+  },
+  "Parameters": {
+    "EnvironmentName": "nls-sandbox",
+    "VpcCidr": "10.10.0.0/16",
+    "PublicSubnet1Cidr": "10.10.0.0/24",
+    "PublicSubnet2Cidr": "10.10.1.0/24",
+    "PrivateSubnet1Cidr": "10.10.10.0/24",
+    "PrivateSubnet2Cidr": "10.10.11.0/24",
+    "CreateDataSubnets": "false",
+    "DataSubnet1Cidr": "10.10.20.0/24",
+    "DataSubnet2Cidr": "10.10.21.0/24",
+    "NatGatewayMode": "Single",
+    "EnableFlowLogs": "true",
+    "LogRetentionDays": "7",
+
+    "AllowedIngressCidr": "0.0.0.0/0",
+    "CertificateArn": "",
+    "HealthCheckPath": "/health",
+    "WafRateLimit": "2000",
+    "EnableWafLogging": "true",
+
+    "AppPort": "80",
+    "InstanceType": "t3.micro",
+    "RootVolumeSize": "20",
+    "MinSize": "2",
+    "MaxSize": "4",
+    "DesiredCapacity": "2",
+    "CpuTargetUtilization": "60",
+
+    "CreateDatabase": "false",
+    "DbEngine": "postgres",
+    "DbEngineVersion": "",
+    "DbInstanceClass": "db.t4g.micro",
+    "DbAllocatedStorage": "20",
+    "DbMaxAllocatedStorage": "100",
+    "DbName": "appdb",
+    "DbMasterUsername": "dbadmin",
+    "DbMultiAZ": "false",
+    "DbBackupRetentionDays": "1",
+    "DbDeletionProtection": "false"
+  }
+}
