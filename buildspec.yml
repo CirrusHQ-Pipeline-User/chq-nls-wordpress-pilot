@@ -22,7 +22,7 @@ phases:
     commands:
       - |
         set -eu
-        TEMPLATES=$(grep -rl --include='*.yml' --include='*.yaml' --exclude-dir=shared-infra '^AWSTemplateFormatVersion' . | sort)
+        TEMPLATES=$(grep -rl --include='*.yml' --include='*.yaml' '^AWSTemplateFormatVersion' . | sort)
 
         if [ -z "$TEMPLATES" ]; then
           echo "No CloudFormation templates found - refusing to publish"

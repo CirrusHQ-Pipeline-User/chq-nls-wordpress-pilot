@@ -46,10 +46,19 @@ guard-rules/                  cfn-guard rules: baseline + one file per cf-templa
 buildspec.yml                 cfn-lint + cfn-guard every template, then sync cf-templates/ to S3
 buildspec-create-changeset.yml  One change set per params file matching PARAM_FILES
 buildspec-execute-changeset.yml Execute those change sets in order, termination protection in prod
-pipelinebuilder.yml           Bootstrap: deploys codepipeline.yml (deployed by hand once)
-codepipeline.yml              Main pipeline
+pipeline-infra.yml            Bootstrap 1 (by hand, once): pipeline KMS key, templates + artefact buckets, SSM params
+pipelinebuilder.yml           Bootstrap 2 (by hand, once): Pipeline Builder - deploys codepipeline.yml
+codepipeline.yml              Main pipeline (deployed and updated by the Pipeline Builder)
 pipeline-params/<env>.json    Parameters for codepipeline.yml
 ```
+
+### Bootstrap (once per account)
+
+1. Deploy `pipeline-infra.yml` by hand (stack `nls-wordpress-pipeline-infra`). It publishes
+   `/nls-wordpress/pipeline/kms-key-arn`, `/template-bucket` and `/artefact-bucket` to SSM.
+2. Deploy `pipelinebuilder.yml` by hand (stack `nls-wordpress-pipelinebuilder-prod`) with the
+   values from `pipeline-params/prod.json`. It needs the CodeStar connection to be `AVAILABLE`.
+3. Push to `main`. The Pipeline Builder deploys `codepipeline.yml`, then starts the main pipeline.
 
 Every root template's nested stacks have `UpdateReplacePolicy: Retain` and
 `DeletionPolicy: RetainExceptOnCreate`. That is Retain, except when a stack's first creation fails:
@@ -119,13 +128,21 @@ A push to `main` runs the **Pipeline Builder**, which updates the main pipeline 
    `cf-templates/` to the template bucket.
 2. **Shared** - change set for `params/<env>/shared.json` -> stack `nls-wordpress-<env>-shared`,
    manual approval, execute.
-3. **Servers** - one change set per `params/<env>/server-*.json` -> stacks
-   `nls-wordpress-<env>-server-NN`, manual approval, execute one after another.
+3. **Server-01 ... Server-04** - one stage per WordPress server, in order: the change set for
+   `params/<env>/server-NN.json` -> stack `nls-wordpress-<env>-server-NN`, **its own manual
+   approval**, then execute. `ServerCount` in `pipeline-params/<env>.json` (currently 3) sets how
+   many server stages exist and must match the number of `server-NN.json` files. Server 01, the
+   pilot, is always first.
 
-The shared stack runs first because the server stacks `Fn::ImportValue` its exports, and an
-import fails at change-set creation if the export does not exist yet. Stacks with no changes are
-skipped. Review the change sets (and their nested change sets) in the **CreateChangeSet(s)** build
-log or the CloudFormation console before approving.
+This is one infrastructure pipeline, as the SoW (D3.12) describes, with one stack, change set and
+approval per server. It is not one pipeline per server. The shared stack runs first because the
+server stacks `Fn::ImportValue` its exports, and an import fails at change-set creation if the
+export does not exist yet. A stage whose stack has no changes still asks for approval and then
+executes nothing. Review the change set (and its nested change sets) in the stage's
+**CreateChangeSet** build log or the CloudFormation console before approving.
+
+To add a fourth server, add `params/<env>/server-04.json` **and** set `ServerCount` to `4`. The
+Pipeline Builder then adds the Server-04 stage.
 
 ### Parameter file format
 
@@ -150,7 +167,7 @@ tagging taxonomy to every params file.
 `server-01.json` to `server-03.json` exist (server 01 is the pilot, D3.9). To add a fourth, copy
 `params/prod/server-03.json` to `server-04.json` and use the server 04 ranges in the CIDR plan. Change
 `ServerName` (`wp02`), the `WordPressServer` tag and the four CIDRs, then merge to `main`. The
-pipeline creates `nls-wordpress-prod-server-02` alongside the existing servers. More than 4
+pipeline creates `nls-wordpress-prod-server-02` alongside the existing servers. Also raise `ServerCount` in `pipeline-params/prod.json`, otherwise the new file has no pipeline stage. More than 4
 servers is a change request under SoW 3.7.
 
 ## Network design (D3.2)

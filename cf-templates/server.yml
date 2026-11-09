@@ -98,7 +98,7 @@ Parameters:
 
   TemplateBucket:
     Type: AWS::SSM::Parameter::Value<String>
-    Default: /EAS-IA/infrastructure/template-bucket
+    Default: /nls-wordpress/pipeline/template-bucket
 
   TemplatePrefix:
     Type: String

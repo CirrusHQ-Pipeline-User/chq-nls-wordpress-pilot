@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - pipeline bootstrap resources (Deliverable D3.12). A customer
+  managed KMS key for the pipelines, the S3 bucket the CloudFormation templates
+  are published to, and the S3 artefact bucket, encrypted with that key,
+  versioned, and expiring artefacts after 30 days. Their names are published
+  to SSM Parameter Store under /nls-wordpress/pipeline/ for pipelinebuilder.yml,
+  codepipeline.yml and the cf-templates root stacks to resolve.
+  Deployed once, by hand, before pipelinebuilder.yml (see README).
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: nls-wordpress
+    AllowedValues: [nls-wordpress]
+    Description: >-
+      Fixed - the SSM parameter names below are referenced literally by the
+      other templates' {{resolve:ssm:/nls-wordpress/pipeline/...}} references.
+
+Resources:
+  PipelineKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ApplicationName} pipelines - artefact bucket and CodeBuild log groups'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsToUseKey
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  PipelineKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ApplicationName}-pipeline'
+      TargetKeyId: !Ref PipelineKey
+
+  PipelineKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nls-wordpress/pipeline/kms-key-arn
+      Type: String
+      Value: !GetAtt PipelineKey.Arn
+      Description: ARN of the customer managed KMS key used by the NLS WordPress pipelines
+
+  # ------------------------------------------------------------------ Templates bucket
+  TemplatesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-pipeline-templates'
+
+  TemplatesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TemplatesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TemplatesBucket.Arn
+              - !Sub '${TemplatesBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: DenyOtherAccounts
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TemplatesBucket.Arn
+              - !Sub '${TemplatesBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalAccount': !Ref AWS::AccountId
+
+  TemplatesBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nls-wordpress/pipeline/template-bucket
+      Type: String
+      Value: !Ref TemplatesBucket
+      Description: S3 bucket the NLS WordPress CloudFormation templates are published to
+
+  # ------------------------------------------------------------------ Artefact bucket
+  ArtefactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PipelineKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtefactsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-pipeline-artefacts'
+
+  ArtefactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtefactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtefactBucket.Arn
+              - !Sub '${ArtefactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: DenyOtherAccounts
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtefactBucket.Arn
+              - !Sub '${ArtefactBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalAccount': !Ref AWS::AccountId
+
+  ArtefactBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nls-wordpress/pipeline/artefact-bucket
+      Type: String
+      Value: !Ref ArtefactBucket
+      Description: S3 artefact bucket for the NLS WordPress pipelines
+
+Outputs:
+  PipelineKeyArn:
+    Value: !GetAtt PipelineKey.Arn
+  TemplatesBucketName:
+    Value: !Ref TemplatesBucket
+  ArtefactBucketName:
+    Value: !Ref ArtefactBucket

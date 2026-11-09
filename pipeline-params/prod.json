@@ -11,7 +11,8 @@
     "BuildLogRetentionInDays": "90",
     "PipelineBuilderName": "nls-wordpress-infra-pipelinebuilder-prod",
     "BranchName": "main",
-    "PipelineNotificationEmail": ""
+    "PipelineNotificationEmail": "",
+    "ServerCount": "3"
   },
   "Tags": {
     "Environment": "prod",

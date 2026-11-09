@@ -105,11 +105,11 @@ Resources:
     Type: AWS::CodePipeline::Pipeline
     Properties:
       ArtifactStore:
-        Location: "{{resolve:ssm:/EAS-IA/infrastructure/artefact-bucket}}"
+        Location: "{{resolve:ssm:/nls-wordpress/pipeline/artefact-bucket}}"
         Type: S3
         EncryptionKey:
           Type: KMS
-          Id: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+          Id: "{{resolve:ssm:/nls-wordpress/pipeline/kms-key-arn}}"
       Name: !Sub "${ApplicationName}-infra-pipelinebuilder-${Environment}"
       RoleArn: !GetAtt PipelineRole.Arn
       Stages:
