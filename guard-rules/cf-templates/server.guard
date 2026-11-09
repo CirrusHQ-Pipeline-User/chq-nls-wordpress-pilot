@@ -1,0 +1,24 @@
+let nested_stacks = Resources.*[ Type == 'AWS::CloudFormation::Stack' ]
+
+# D3.1 - nested stacks come from the pipeline's template bucket and time out
+rule nested_stacks_from_template_bucket_with_timeouts {
+    %nested_stacks !empty
+    %nested_stacks.Properties.TemplateURL.'Fn::Sub' == /^https:\/\/\$\{TemplateBucket\}\.s3\./
+    %nested_stacks.Properties.TimeoutInMinutes exists
+}
+
+# D3.1 - nested stack resources retained on delete and replacement.
+# RetainExceptOnCreate behaves as Retain except when the stack's first
+# creation fails, so a failed first deploy does not orphan nested stacks.
+rule nested_stacks_retained {
+    %nested_stacks.DeletionPolicy in ['Retain', 'RetainExceptOnCreate']
+    %nested_stacks.UpdateReplacePolicy == 'Retain'
+}
+
+# D3.2 - a server stack never creates network-wide components; those belong
+# to the Customer's LZA or to the shared stack
+rule no_vpc_or_gateways_in_server_stack {
+    Resources.*[ Type == 'AWS::EC2::VPC' ] empty
+    Resources.*[ Type == 'AWS::EC2::InternetGateway' ] empty
+    Resources.*[ Type == 'AWS::EC2::TransitGatewayAttachment' ] empty
+}

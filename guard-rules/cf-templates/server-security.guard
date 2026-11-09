@@ -1,0 +1,26 @@
+let security_groups = Resources.*[ Type == 'AWS::EC2::SecurityGroup' ]
+
+# D3.2 - EC2 and DB groups take traffic from the security group in front of
+# them only (security-group references, not IP ranges)
+rule ec2_and_db_ingress_from_security_groups_only {
+    Resources.Ec2SecurityGroup.Properties.SecurityGroupIngress[*] {
+        SourceSecurityGroupId exists
+        CidrIp not exists
+    }
+    Resources.DbSecurityGroup.Properties.SecurityGroupIngress[*] {
+        SourceSecurityGroupId exists
+        CidrIp not exists
+    }
+}
+
+# Every group declares its egress, so none keeps the default allow-all rule
+rule security_groups_declare_egress {
+    %security_groups !empty
+    %security_groups.Properties.SecurityGroupEgress exists
+    %security_groups.Properties.SecurityGroupEgress[ IpProtocol in ['-1', -1] ] empty
+}
+
+# D3.5 - the database tier has no outbound access
+rule db_security_group_has_no_outbound {
+    Resources.DbSecurityGroup.Properties.SecurityGroupEgress[*].CidrIp == '127.0.0.1/32'
+}

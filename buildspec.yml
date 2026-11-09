@@ -1,0 +1,77 @@
+version: 0.2
+
+env:
+  variables:
+    GUARD_RULES_DIR: guard-rules
+    GUARD_BASELINE: guard-rules/baseline.guard
+    GUARD_VERSION: 3.2.1
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet --upgrade pip cfn-lint
+      - curl -sSL "https://github.com/aws-cloudformation/cloudformation-guard/releases/download/${GUARD_VERSION}/cfn-guard-v3-ubuntu-latest.tar.gz" -o /tmp/cfn-guard.tar.gz
+      - tar -xzf /tmp/cfn-guard.tar.gz -C /tmp
+      - install -m 0755 "$(find /tmp -name cfn-guard -type f | head -1)" /usr/local/bin/cfn-guard
+      - cfn-lint --version
+      - cfn-guard --version
+
+  pre_build:
+    commands:
+      - |
+        set -eu
+        TEMPLATES=$(grep -rl --include='*.yml' --include='*.yaml' --exclude-dir=shared-infra '^AWSTemplateFormatVersion' . | sort)
+
+        if [ -z "$TEMPLATES" ]; then
+          echo "No CloudFormation templates found - refusing to publish"
+          exit 1
+        fi
+
+        if [ ! -f "$GUARD_BASELINE" ]; then
+          echo "Missing $GUARD_BASELINE - refusing to publish"
+          exit 1
+        fi
+
+        echo "Templates under validation:"
+        echo "$TEMPLATES" | sed 's/^/  /'
+
+        FAILED=0
+
+        echo "----- cfn-lint -----"
+        cfn-lint --regions "${AWS_REGION:-eu-west-2}" --non-zero-exit-code error -t $TEMPLATES || FAILED=1
+
+        echo "----- cfn-guard -----"
+        for t in $TEMPLATES; do
+          RULE_ARGS="--rules $GUARD_BASELINE"
+
+          case "$t" in
+            ./cf-templates/*)
+              base=$(basename "$t")
+              specific="$GUARD_RULES_DIR/cf-templates/${base%.*}.guard"
+              if [ ! -f "$specific" ]; then
+                echo "  $t -> MISSING RULES FILE $specific"
+                FAILED=1
+                continue
+              fi
+              RULE_ARGS="$RULE_ARGS --rules $specific"
+              ;;
+          esac
+
+          echo "  $t"
+          cfn-guard validate --data "$t" $RULE_ARGS || FAILED=1
+        done
+
+        if [ "$FAILED" -ne 0 ]; then
+          echo "cfn-lint or cfn-guard reported failures, or a rules file is missing - refusing to publish"
+          exit 1
+        fi
+
+  build:
+    commands:
+      - aws s3 sync cf-templates/ "s3://$TEMPLATE_BUCKET/$TEMPLATE_PREFIX/" --delete
+
+artifacts:
+  files:
+    - '**/*'

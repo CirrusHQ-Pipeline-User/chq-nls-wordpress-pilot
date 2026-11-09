@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Main deployment pipeline
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - stage
+      - prod
+
+  PipelineName:
+    Type: String
+
+  ApplicationName:
+    Type: String
+
+  ConnectionArn:
+    Type: String
+
+  FullRepositoryId:
+    Type: String
+
+  BranchName:
+    Type: String
+
+  TemplatePrefix:
+    Type: String
+
+  ApprovalForCloudformationStage:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  PipelineBuilderName:
+    Type: String
+
+  MainPipelineChangesOnPush:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether a push to BranchName is deployed by the main pipeline. The
+      pipeline builder runs on every push either way; 'true' starts the
+      main pipeline when it succeeds, 'false' leaves the main pipeline to be
+      started by hand.
+
+  BuildLogRetentionInDays:
+    Type: Number
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Days to keep CodeBuild logs
+
+  PipelineNotificationEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([^@\s]+@[^@\s]+\.[^@\s]+)?$'
+    Description: >-
+      Deliverable D3.12 - Customer contact emailed when a pipeline execution
+      fails (blank = topic only). The recipient must confirm the subscription.
+
+Conditions:
+  UseApproval: !Equals [!Ref ApprovalForCloudformationStage, "true"]
+  RunMainPipelineOnPush: !Equals [!Ref MainPipelineChangesOnPush, "true"]
+  HasPipelineNotificationEmail: !Not [!Equals [!Ref PipelineNotificationEmail, ""]]
+  # Deliverable 2.13: termination protection on the Production stacks only
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  CFNRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F38
+            reason: "CloudFormation deployment role requires broad permissions to create any resource type"
+          - id: F3
+            reason: "CloudFormation deployment role requires broad permissions to create any resource type"
+          - id: W11
+            reason: "CloudFormation deployment role requires broad permissions to create any resource type"
+    Properties:
+      RoleName: !Sub "${ApplicationName}-${Environment}-cfn-deploy"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: "*"
+
+  CFNRoleSSMParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/EAS-IA/infrastructure/${ApplicationName}/${Environment}/cfn-deploy-role-arn"
+      Type: String
+      Value: !GetAtt CFNRole.Arn
+      Description: ARN of the CloudFormation deployment role the main pipeline deploys with
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "Pipeline role requires broad permissions to orchestrate deployments"
+          - id: W11
+            reason: "Pipeline role requires broad permissions to orchestrate deployments"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - cloudformation:*
+                  - kms:*
+                  - codestar-connections:UseConnection
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt CFNRole.Arn
+                  - !GetAtt CodeBuildRole.Arn
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "CodeBuild role requires broad S3 and logs permissions for template publishing"
+          - id: W11
+            reason: "CodeBuild role requires broad S3 and logs permissions for template publishing"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PublishTemplatesAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}"
+                    - Bucket: "{{resolve:ssm:/EAS-IA/infrastructure/template-bucket}}"
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}/*"
+                    - Bucket: "{{resolve:ssm:/EAS-IA/infrastructure/template-bucket}}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}"
+                    - Bucket: "{{resolve:ssm:/EAS-IA/infrastructure/artefact-bucket}}"
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}/*"
+                    - Bucket: "{{resolve:ssm:/EAS-IA/infrastructure/artefact-bucket}}"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:UpdateTerminationProtection
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationName}-${Environment}*/*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CFNRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/EAS-IA/*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+
+  PublishTemplatesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/codebuild/${PipelineName}-publish-templates-${Environment}"
+      KmsKeyId: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      RetentionInDays: !Ref BuildLogRetentionInDays
+
+  PublishTemplatesProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-publish-templates-${Environment}"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      EncryptionKey: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref PublishTemplatesLogGroup
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: TEMPLATE_BUCKET
+            Value: "{{resolve:ssm:/EAS-IA/infrastructure/template-bucket}}"
+          - Name: TEMPLATE_PREFIX
+            Value: !Ref TemplatePrefix
+    DeletionPolicy: Delete
+
+  CreateChangeSetLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/codebuild/${PipelineName}-create-changeset-${Environment}"
+      KmsKeyId: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      RetentionInDays: !Ref BuildLogRetentionInDays
+
+  CreateChangeSetProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-create-changeset-${Environment}"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      EncryptionKey: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CreateChangeSetLogGroup
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-create-changeset.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          # One stack per params/<env>/<name>.json file: <STACK_PREFIX>-<name>.
+          # PARAM_FILES is set by each pipeline action (shared, then servers).
+          - Name: STACK_PREFIX
+            Value: !Sub "${ApplicationName}-${Environment}"
+          - Name: PARAM_FILES
+            Value: "*.json"
+          - Name: TEMPLATE_BUCKET
+            Value: "{{resolve:ssm:/EAS-IA/infrastructure/template-bucket}}"
+          - Name: TEMPLATE_PREFIX
+            Value: !Ref TemplatePrefix
+          - Name: CFN_ROLE_ARN
+            Value: !GetAtt CFNRole.Arn
+    DeletionPolicy: Delete
+
+  ExecuteChangeSetLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/codebuild/${PipelineName}-execute-changeset-${Environment}"
+      KmsKeyId: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      RetentionInDays: !Ref BuildLogRetentionInDays
+
+  ExecuteChangeSetProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-execute-changeset-${Environment}"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      EncryptionKey: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      TimeoutInMinutes: 180
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ExecuteChangeSetLogGroup
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-execute-changeset.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_PREFIX
+            Value: !Sub "${ApplicationName}-${Environment}"
+          - Name: PARAM_FILES
+            Value: "*.json"
+          - Name: TERMINATION_PROTECTION
+            Value: !If [IsProd, "true", "false"]
+    DeletionPolicy: Delete
+
+  MainPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${PipelineName}-main-${Environment}"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: "{{resolve:ssm:/EAS-IA/infrastructure/artefact-bucket}}"
+        EncryptionKey:
+          Type: KMS
+          Id: "{{resolve:ssm:/EAS-IA/infrastructure/pipeline-kms-key-arn}}"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: false   
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+        - Name: PublishAndTestTemplates
+          Actions:
+            - Name: TestAndUploadTemplatesToS3
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref PublishTemplatesProject
+              RunOrder: 1
+
+        # The shared stack is created and executed first: the server stacks
+        # import its exports, and an import of an export that does not exist
+        # yet fails at change-set creation.
+        - Name: !If [UseApproval, Shared-CreateChangeSet-ManualApproval-Execute, Shared-CreateAndExecuteChangeSet]
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref CreateChangeSetProject
+                EnvironmentVariables: '[{"name":"PARAM_FILES","value":"shared.json","type":"PLAINTEXT"}]'
+              RunOrder: 1
+
+            - !If
+              - UseApproval
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration:
+                  CustomData: !Sub "Review change set ${ApplicationName}-${Environment}-shared and its nested change sets, then approve"
+                RunOrder: 2
+              - !Ref AWS::NoValue
+
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref ExecuteChangeSetProject
+                EnvironmentVariables: '[{"name":"PARAM_FILES","value":"shared.json","type":"PLAINTEXT"}]'
+              RunOrder: 3
+
+        # One reference architecture stack per WordPress server
+        # (params/<env>/server-NN.json -> <app>-<env>-server-NN), up to 4.
+        - Name: !If [UseApproval, Servers-CreateChangeSets-ManualApproval-Execute, Servers-CreateAndExecuteChangeSets]
+          Actions:
+            - Name: CreateChangeSets
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref CreateChangeSetProject
+                EnvironmentVariables: '[{"name":"PARAM_FILES","value":"server-*.json","type":"PLAINTEXT"}]'
+              RunOrder: 1
+
+            - !If
+              - UseApproval
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration:
+                  CustomData: !Sub "Review the change sets on each ${ApplicationName}-${Environment}-server-NN stack (see the CreateChangeSets build log), then approve"
+                RunOrder: 2
+              - !Ref AWS::NoValue
+
+            - Name: ExecuteChangeSets
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref ExecuteChangeSetProject
+                EnvironmentVariables: '[{"name":"PARAM_FILES","value":"server-*.json","type":"PLAINTEXT"}]'
+              RunOrder: 3
+    DeletionPolicy: Delete
+
+  MainPipelineStartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      Description: Trigger MainPipeline when PipelineBuilder succeeds
+      State: !If [RunMainPipelineOnPush, ENABLED, DISABLED]
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+        detail:
+          pipeline:
+            - !Ref PipelineBuilderName
+          state:
+            - SUCCEEDED
+      Targets:
+        - Id: StartMainPipeline
+          Arn: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${MainPipeline}"
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartMainPipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${MainPipeline}"
+
+  # ---------------------------------------------------------------------------
+  # Deliverable D3.12 - notify nominated Customer contacts of pipeline failures.
+  # A dedicated key, because EventBridge must be allowed to use it to publish
+  # to the encrypted topic and the shared pipeline key's policy is not ours.
+  # ---------------------------------------------------------------------------
+  PipelineNotificationKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ApplicationName} ${Environment} pipeline failure notifications topic"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowEventBridgeToPublishToEncryptedTopic
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  PipelineNotificationKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ApplicationName}-${Environment}-pipeline-notifications"
+      TargetKeyId: !Ref PipelineNotificationKey
+
+  PipelineFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ApplicationName}-${Environment}-pipeline-failures"
+      DisplayName: !Sub "${ApplicationName} ${Environment} pipeline failures"
+      KmsMasterKeyId: !Ref PipelineNotificationKey
+
+  PipelineFailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref PipelineFailureTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineFailureTopic
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  PipelineFailureEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasPipelineNotificationEmail
+    Properties:
+      TopicArn: !Ref PipelineFailureTopic
+      Protocol: email
+      Endpoint: !Ref PipelineNotificationEmail
+
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-failures"
+      Description: Notify the pipeline failure topic when the main pipeline or the pipeline builder fails
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+        detail:
+          pipeline:
+            - !Ref MainPipeline
+            - !Ref PipelineBuilderName
+          state:
+            - FAILED
+      Targets:
+        - Id: PipelineFailureTopic
+          Arn: !Ref PipelineFailureTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+              execution: "$.detail.execution-id"
+              time: "$.time"
+            InputTemplate: >-
+              "Pipeline <pipeline> FAILED at <time> (execution <execution>). Open CodePipeline in the WordPress account to see which stage failed."
+
+Outputs:
+  PipelineFailureTopicArn:
+    Value: !Ref PipelineFailureTopic

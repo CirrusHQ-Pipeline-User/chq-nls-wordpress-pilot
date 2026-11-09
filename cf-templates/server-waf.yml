@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - edge protection for one WordPress server (nested in
+  server.yml, Deliverables D3.3 / D3.8). AWS WAF web ACL on the server's ALB with
+  AWS managed rules (IP reputation, bad bots, common/XSS, known bad inputs,
+  SQL injection, WordPress), rate limiting, an IP deny-list, and wp-admin
+  restricted to the Customer's approved IP addresses. Count mode for Customer
+  testing, then block mode before cutover. Logs to CloudWatch Logs; optional
+  Shield Advanced protection of the ALB.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  ServerName:
+    Type: String
+  LoadBalancerArn:
+    Type: String
+  KmsKeyArn:
+    Type: String
+  RuleAction:
+    Type: String
+    AllowedValues: [count, block]
+  AdminAllowedCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+  BlockedCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+  RateLimitPerFiveMinutes:
+    Type: Number
+    Default: 2000
+  EnableBotControl:
+    Type: String
+    AllowedValues: ['true', 'false']
+  EnableShieldAdvanced:
+    Type: String
+    AllowedValues: ['true', 'false']
+  WafLogRetentionInDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  CountMode: !Equals [!Ref RuleAction, count]
+  HasAdminCidrs: !Not [!Equals [!Join ['', !Ref AdminAllowedCidrs], '']]
+  HasBlockedCidrs: !Not [!Equals [!Join ['', !Ref BlockedCidrs], '']]
+  BotControl: !Equals [!Ref EnableBotControl, 'true']
+  ShieldAdvanced: !Equals [!Ref EnableShieldAdvanced, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ IP sets
+  # With no approved addresses the allow-list is empty, which (in block mode)
+  # blocks wp-admin for everyone - the safe default.
+  AdminIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-${ServerName}-admin-allow'
+      Description: Customer-approved public IPs allowed to reach wp-admin and wp-login.php
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !If [HasAdminCidrs, !Ref AdminAllowedCidrs, []]
+
+  DenyIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-${ServerName}-deny'
+      Description: Public IPs denied access to the site
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !If [HasBlockedCidrs, !Ref BlockedCidrs, []]
+
+  # ------------------------------------------------------------------ Web ACL
+  # Managed rule groups are not evaluated for requests from the approved
+  # admin IPs (scope-down), so the block editor and media uploads from the
+  # Customer's own addresses are not caught by body-inspection rules such as
+  # SizeRestrictions_BODY and CrossSiteScripting_BODY. Public traffic gets
+  # every rule. Approximate capacity: ~1,300 of the 1,500 default WCU.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-${ServerName}'
+      Description: !Sub 'Protects the ${ServerName} WordPress ALB'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ApplicationName}-${Environment}-${ServerName}'
+      Rules:
+        - Name: DenyListedIps
+          Priority: 0
+          Action: !If [CountMode, {Count: {}}, {Block: {}}]
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt DenyIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: DenyListedIps
+
+        # wp-admin and wp-login.php only from the approved IPs.
+        # admin-ajax.php is excluded because public pages call it.
+        - Name: AdminPathsFromApprovedIpsOnly
+          Priority: 1
+          Action: !If [CountMode, {Count: {}}, {Block: {}}]
+          Statement:
+            AndStatement:
+              Statements:
+                - OrStatement:
+                    Statements:
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: /wp-admin
+                          TextTransformations:
+                            - { Priority: 0, Type: URL_DECODE }
+                            - { Priority: 1, Type: LOWERCASE }
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: /wp-login.php
+                          TextTransformations:
+                            - { Priority: 0, Type: URL_DECODE }
+                            - { Priority: 1, Type: LOWERCASE }
+                - NotStatement:
+                    Statement:
+                      ByteMatchStatement:
+                        FieldToMatch: { UriPath: {} }
+                        PositionalConstraint: EXACTLY
+                        SearchString: /wp-admin/admin-ajax.php
+                        TextTransformations:
+                          - { Priority: 0, Type: URL_DECODE }
+                          - { Priority: 1, Type: LOWERCASE }
+                - NotStatement:
+                    Statement:
+                      IPSetReferenceStatement:
+                        Arn: !GetAtt AdminIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AdminPathsFromApprovedIpsOnly
+
+        - Name: RateLimitPerIp
+          Priority: 2
+          Action: !If [CountMode, {Count: {}}, {Block: {}}]
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerFiveMinutes
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+
+        - Name: AWS-AWSManagedRulesAmazonIpReputationList
+          Priority: 3
+          OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAmazonIpReputationList
+
+        - !If
+          - BotControl
+          - Name: AWS-AWSManagedRulesBotControlRuleSet
+            Priority: 4
+            OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesBotControlRuleSet
+                ManagedRuleGroupConfigs:
+                  - AWSManagedRulesBotControlRuleSet:
+                      InspectionLevel: COMMON
+                ScopeDownStatement:
+                  NotStatement:
+                    Statement:
+                      IPSetReferenceStatement:
+                        Arn: !GetAtt AdminIpSet.Arn
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: AWSManagedRulesBotControlRuleSet
+          - !Ref 'AWS::NoValue'
+
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 5
+          OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ScopeDownStatement:
+                NotStatement:
+                  Statement:
+                    IPSetReferenceStatement:
+                      Arn: !GetAtt AdminIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 6
+          OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 7
+          OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+              ScopeDownStatement:
+                NotStatement:
+                  Statement:
+                    IPSetReferenceStatement:
+                      Arn: !GetAtt AdminIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+
+        # Includes WordPressExploitableCommands_QUERYSTRING and
+        # WordPressExploitablePaths_URIPATH (SoW D3.3)
+        - Name: AWS-AWSManagedRulesWordPressRuleSet
+          Priority: 8
+          OverrideAction: !If [CountMode, {Count: {}}, {None: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesWordPressRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesWordPressRuleSet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-web-acl'
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancerArn
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ------------------------------------------------------------------ Logging (30 days)
+  # WAF requires the log group name to start with aws-waf-logs-
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'aws-waf-logs-${ApplicationName}-${Environment}-${ServerName}'
+      RetentionInDays: !Ref WafLogRetentionInDays
+      KmsKeyId: !Ref KmsKeyArn
+
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+      RedactedFields:
+        - SingleHeader: { Name: authorization }
+        - SingleHeader: { Name: cookie }
+
+  # ------------------------------------------------------------------ Shield Advanced
+  # Needs the Customer's existing Shield Advanced subscription in this
+  # account (SoW D3.3 assumption). Automatic application-layer mitigation
+  # adds a Shield-managed rule group to the web ACL, which CloudFormation
+  # reports as drift on WebAcl.
+  ShieldProtection:
+    Type: AWS::Shield::Protection
+    Condition: ShieldAdvanced
+    DependsOn: WebAclAssociation
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-${ServerName}-alb'
+      ResourceArn: !Ref LoadBalancerArn
+      ApplicationLayerAutomaticResponseConfiguration:
+        Status: ENABLED
+        Action: !If [CountMode, {Count: {}}, {Block: {}}]
+
+Outputs:
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn
+  WebAclName:
+    Value: !Sub '${ApplicationName}-${Environment}-${ServerName}'
+  WafLogGroupName:
+    Value: !Ref WafLogGroup

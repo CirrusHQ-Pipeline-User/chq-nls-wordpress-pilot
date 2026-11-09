@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - monitoring for one WordPress server (nested in server.yml,
+  Deliverable D3.7). CloudWatch agent configuration (system and memory
+  metrics, system and application logs) applied through Systems Manager, log
+  groups encrypted with the workload CMK, alarms notifying the shared SNS
+  topic, and a dashboard of EC2, ALB and target health metrics.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  ServerName:
+    Type: String
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+  LoadBalancerFullName:
+    Type: String
+  TargetGroupFullName:
+    Type: String
+  AlarmTopicArn:
+    Type: String
+  KmsKeyArn:
+    Type: String
+  CloudWatchAgentDocumentName:
+    Type: String
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+  CpuAlarmThreshold:
+    Type: Number
+    Default: 80
+  MemoryAlarmThreshold:
+    Type: Number
+    Default: 85
+  DiskAlarmThreshold:
+    Type: Number
+    Default: 85
+  Alb5xxAlarmThreshold:
+    Type: Number
+    Default: 10
+
+Resources:
+  # ------------------------------------------------------------------ Logs
+  SystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ApplicationName}/${Environment}/${ServerName}/system'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !Ref KmsKeyArn
+
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ApplicationName}/${Environment}/${ServerName}/application'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !Ref KmsKeyArn
+
+  # ------------------------------------------------------------------ CloudWatch agent
+  # The name must start with AmazonCloudWatch- : the instance role's
+  # CloudWatchAgentServerPolicy only allows reading parameters with that prefix.
+  # Files that do not exist on a server are skipped by the agent. Debian 12
+  # logs to the systemd journal and has no /var/log/syslog unless rsyslog is
+  # installed. Add the Customer's application log paths (D3.7) to collect_list.
+  CloudWatchAgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub 'AmazonCloudWatch-${ApplicationName}-${Environment}-${ServerName}'
+      Type: String
+      Tier: Standard
+      Description: !Sub 'CloudWatch agent configuration for ${ServerName}'
+      Value: !Sub |
+        {
+          "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+          "metrics": {
+            "namespace": "CWAgent",
+            "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+            "aggregation_dimensions": [["InstanceId"], ["InstanceId", "path"]],
+            "metrics_collected": {
+              "mem": { "measurement": ["mem_used_percent"] },
+              "swap": { "measurement": ["swap_used_percent"] },
+              "disk": {
+                "measurement": ["used_percent"],
+                "resources": ["/"],
+                "drop_device": true,
+                "ignore_file_system_types": ["sysfs", "devtmpfs", "tmpfs", "overlay", "squashfs"]
+              }
+            }
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  { "file_path": "/var/log/syslog", "log_group_name": "${SystemLogGroup}", "log_stream_name": "{instance_id}/syslog" },
+                  { "file_path": "/var/log/auth.log", "log_group_name": "${SystemLogGroup}", "log_stream_name": "{instance_id}/auth" },
+                  { "file_path": "/var/log/cloud-init-output.log", "log_group_name": "${SystemLogGroup}", "log_stream_name": "{instance_id}/cloud-init" },
+                  { "file_path": "/var/log/amazon/ssm/amazon-ssm-agent.log", "log_group_name": "${SystemLogGroup}", "log_stream_name": "{instance_id}/ssm-agent" },
+                  { "file_path": "/var/log/placeholder-bootstrap.log", "log_group_name": "${SystemLogGroup}", "log_stream_name": "{instance_id}/placeholder-bootstrap" },
+                  { "file_path": "/var/log/apache2/access.log", "log_group_name": "${ApplicationLogGroup}", "log_stream_name": "{instance_id}/apache-access" },
+                  { "file_path": "/var/log/apache2/error.log", "log_group_name": "${ApplicationLogGroup}", "log_stream_name": "{instance_id}/apache-error" },
+                  { "file_path": "/var/log/nginx/access.log", "log_group_name": "${ApplicationLogGroup}", "log_stream_name": "{instance_id}/nginx-access" },
+                  { "file_path": "/var/log/nginx/error.log", "log_group_name": "${ApplicationLogGroup}", "log_stream_name": "{instance_id}/nginx-error" }
+                ]
+              }
+            }
+          }
+        }
+
+  # Runs when the instance registers with Systems Manager, and again whenever
+  # the instance is replaced (e.g. placeholder -> migrated server).
+  CloudWatchAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub '${ApplicationName}-${Environment}-${ServerName}-cloudwatch-agent'
+      Name: !Ref CloudWatchAgentDocumentName
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref InstanceId]
+      Parameters:
+        ConfigParameterName: [!Ref CloudWatchAgentConfig]
+
+  # ------------------------------------------------------------------ Alarms
+  # Agent metrics treat missing data as not breaching, so nothing alarms
+  # before the agent is running.
+  StatusCheckSystemAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-status-check-system'
+      AlarmDescription: System status check failed - EC2 recovers the instance onto healthy hardware
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref InstanceId }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover'
+        - !Ref AlarmTopicArn
+      OKActions: [!Ref AlarmTopicArn]
+
+  StatusCheckInstanceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-status-check-instance'
+      AlarmDescription: Instance status check failed - the operating system is not responding
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref InstanceId }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-cpu-high'
+      AlarmDescription: !Sub 'Average CPU above ${CpuAlarmThreshold}% for 15 minutes'
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref InstanceId }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref CpuAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-memory-high'
+      AlarmDescription: !Sub 'Memory use above ${MemoryAlarmThreshold}% for 15 minutes (CloudWatch agent)'
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref InstanceId }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref MemoryAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  DiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-root-disk-high'
+      AlarmDescription: !Sub 'Root filesystem above ${DiskAlarmThreshold}% used (CloudWatch agent)'
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref InstanceId }
+        - { Name: path, Value: / }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DiskAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  NoHealthyTargetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-no-healthy-target'
+      AlarmDescription: The ALB has no healthy target - the site is down
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !Ref LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !Ref TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-${ServerName}-alb-5xx'
+      AlarmDescription: !Sub 'More than ${Alb5xxAlarmThreshold} load balancer 5xx responses in 5 minutes'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !Ref LoadBalancerFullName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Alb5xxAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+
+  # ------------------------------------------------------------------ Dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${Environment}-${ServerName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "properties": { "title": "EC2 CPU %", "region": "${AWS::Region}", "stat": "Average", "period": 300,
+                "metrics": [["AWS/EC2", "CPUUtilization", "InstanceId", "${InstanceId}"]] } },
+            { "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+              "properties": { "title": "Memory and root disk used %", "region": "${AWS::Region}", "stat": "Average", "period": 300,
+                "metrics": [["CWAgent", "mem_used_percent", "InstanceId", "${InstanceId}"],
+                            ["CWAgent", "disk_used_percent", "InstanceId", "${InstanceId}", "path", "/"]] } },
+            { "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "properties": { "title": "EC2 status checks failed", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [["AWS/EC2", "StatusCheckFailed_System", "InstanceId", "${InstanceId}"],
+                            ["AWS/EC2", "StatusCheckFailed_Instance", "InstanceId", "${InstanceId}"]] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 8, "height": 6,
+              "properties": { "title": "ALB requests", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancerFullName}"]] } },
+            { "type": "metric", "x": 8, "y": 6, "width": 8, "height": 6,
+              "properties": { "title": "ALB and target errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${LoadBalancerFullName}"],
+                            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${LoadBalancerFullName}"],
+                            ["AWS/ApplicationELB", "HTTPCode_ELB_4XX_Count", "LoadBalancer", "${LoadBalancerFullName}"]] } },
+            { "type": "metric", "x": 16, "y": 6, "width": 8, "height": 6,
+              "properties": { "title": "Target health and response time", "region": "${AWS::Region}", "period": 60,
+                "metrics": [["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}", { "stat": "Minimum" }],
+                            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}", { "stat": "Maximum" }],
+                            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancerFullName}", { "stat": "Average", "yAxis": "right" }]] } }
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Value: !Ref Dashboard
+  SystemLogGroupName:
+    Value: !Ref SystemLogGroup
+  ApplicationLogGroupName:
+    Value: !Ref ApplicationLogGroup
+  CloudWatchAgentConfigParameter:
+    Value: !Ref CloudWatchAgentConfig

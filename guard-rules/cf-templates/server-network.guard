@@ -1,0 +1,78 @@
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
+let routes = Resources.*[ Type == 'AWS::EC2::Route' ]
+let app_internet_entries = Resources.*[
+    Type == 'AWS::EC2::NetworkAclEntry'
+    Properties.NetworkAclId.Ref == 'AppNetworkAcl'
+    Properties.CidrBlock == '0.0.0.0/0'
+]
+
+rule private_subnets_get_no_public_ips {
+    %subnets !empty
+    %subnets.Properties.MapPublicIpOnLaunch == false
+}
+
+# D3.2 - the App subnet's only route out is the Transit Gateway (centralised
+# egress); nothing routes to an Internet Gateway or NAT Gateway
+rule only_route_is_app_default_route_to_transit_gateway {
+    %routes !empty
+    %routes.Properties.RouteTableId.Ref == 'AppRouteTable'
+    %routes.Properties.DestinationCidrBlock == '0.0.0.0/0'
+    %routes.Properties.TransitGatewayId exists
+    %routes.Properties.GatewayId not exists
+    %routes.Properties.NatGatewayId not exists
+}
+
+# D3.2 - no gateways, Elastic IPs or VPCs in a server stack
+rule no_gateways_or_elastic_ips {
+    Resources.*[ Type == 'AWS::EC2::VPC' ] empty
+    Resources.*[ Type == 'AWS::EC2::InternetGateway' ] empty
+    Resources.*[ Type == 'AWS::EC2::EIP' ] empty
+}
+
+# D3.2 - each subnet has its own dedicated network ACL
+rule each_subnet_has_its_own_network_acl {
+    Resources.*[
+        Type == 'AWS::EC2::SubnetNetworkAclAssociation'
+        Properties.SubnetId.Ref == 'AppSubnet'
+        Properties.NetworkAclId.Ref == 'AppNetworkAcl'
+    ] !empty
+    Resources.*[
+        Type == 'AWS::EC2::SubnetNetworkAclAssociation'
+        Properties.SubnetId.Ref == 'DataSubnet'
+        Properties.NetworkAclId.Ref == 'DataNetworkAcl'
+    ] !empty
+}
+
+# D3.2 - server-to-server isolation: the App ACL denies the VPC CIDR in both
+# directions, and every 0.0.0.0/0 rule is numbered after that deny
+rule app_network_acl_denies_vpc_in_both_directions {
+    Resources.*[
+        Type == 'AWS::EC2::NetworkAclEntry'
+        Properties.NetworkAclId.Ref == 'AppNetworkAcl'
+        Properties.RuleAction == 'deny'
+        Properties.CidrBlock.Ref == 'VpcCidr'
+        Properties.Egress == false
+    ] !empty
+    Resources.*[
+        Type == 'AWS::EC2::NetworkAclEntry'
+        Properties.NetworkAclId.Ref == 'AppNetworkAcl'
+        Properties.RuleAction == 'deny'
+        Properties.CidrBlock.Ref == 'VpcCidr'
+        Properties.Egress == true
+    ] !empty
+}
+
+rule app_internet_rules_follow_vpc_deny when %app_internet_entries !empty {
+    %app_internet_entries.Properties.RuleNumber > 200
+}
+
+# D3.2 - the Data ACL only ever references this server's App subnet
+rule data_network_acl_only_talks_to_app_subnet {
+    Resources.*[
+        Type == 'AWS::EC2::NetworkAclEntry'
+        Properties.NetworkAclId.Ref == 'DataNetworkAcl'
+    ] {
+        Properties.CidrBlock.Ref == 'AppSubnetCidr'
+        Properties.RuleAction == 'allow'
+    }
+}

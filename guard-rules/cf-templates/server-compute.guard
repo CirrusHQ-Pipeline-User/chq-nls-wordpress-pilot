@@ -1,0 +1,36 @@
+let instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+let secrets = Resources.*[ Type == 'AWS::SecretsManager::Secret' ]
+
+# D3.4 - root volume encrypted with the workload CMK
+rule instance_root_volume_encrypted_with_cmk {
+    %instances !empty
+    %instances.Properties.BlockDeviceMappings[*].Ebs.Encrypted == true
+    %instances.Properties.BlockDeviceMappings[*].Ebs.KmsKeyId exists
+}
+
+# D3.4 - OS access through SSM only: no key pair, no public address
+rule instance_has_no_ssh_key_or_public_ip {
+    %instances.Properties.KeyName not exists
+    %instances.Properties.NetworkInterfaces not exists
+}
+
+# D3.4 - the stateful instance survives replacement and stack deletion
+rule instance_retained {
+    %instances.DeletionPolicy in ['Retain', 'RetainExceptOnCreate']
+    %instances.UpdateReplacePolicy == 'Retain'
+}
+
+# D3.4 - instance role: SSM and CloudWatch agent managed policies only, no inline policies
+rule instance_role_ssm_and_cloudwatch_only {
+    Resources.InstanceRole.Properties.Policies not exists
+    Resources.InstanceRole.Properties.ManagedPolicyArns[*].'Fn::Sub' in [
+        'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore',
+        'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+    ]
+}
+
+# D3.6 - secrets encrypted with the workload CMK
+rule secrets_encrypted_with_cmk {
+    %secrets !empty
+    %secrets.Properties.KmsKeyId exists
+}

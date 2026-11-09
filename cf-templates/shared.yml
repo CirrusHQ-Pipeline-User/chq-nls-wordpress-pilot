@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - shared stack (root). Resources every WordPress server stack in
+  the WordPress account depends on, inside the Customer's existing LZA VPC:
+  the public ALB subnets, Internet Gateway and public network ACL (D3.2), the
+  customer managed KMS key, alarm SNS topic and CloudWatch agent document
+  (D3.6 / D3.7), the Route 53 private hosted zone and the optional ACM
+  wildcard certificate (D3.3). Deployed once per environment by the main
+  pipeline, before the server stacks, which import its exports.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General
+        Parameters:
+          - ApplicationName
+          - Environment
+          - TemplateBucket
+          - TemplatePrefix
+      - Label:
+          default: 'Deliverable D3.2 - Customer-provided LZA network'
+        Parameters:
+          - VpcId
+          - VpcCidr
+          - TransitGatewayId
+      - Label:
+          default: 'Deliverable D3.2 - Shared public ALB subnets'
+        Parameters:
+          - AvailabilityZones
+          - PublicSubnetCidrs
+          - TargetPort
+      - Label:
+          default: 'Deliverable D3.3 - DNS and certificates'
+        Parameters:
+          - PrivateHostedZoneName
+          - CertificateDomainName
+      - Label:
+          default: 'Deliverables D3.6 / D3.7 - Encryption and alarm notifications'
+        Parameters:
+          - AlarmEmailAddress
+    ParameterLabels:
+      ApplicationName:
+        default: Application name (resource name and export prefix, e.g. nls-wordpress)
+      Environment:
+        default: Environment name
+      TemplateBucket:
+        default: SSM parameter naming the S3 bucket the nested stack templates are synced to
+      TemplatePrefix:
+        default: Key prefix the nested stack templates are synced under (set by the pipeline)
+      VpcId:
+        default: The Customer's existing WordPress VPC, created by the LZA
+      VpcCidr:
+        default: Primary CIDR of that VPC
+      TransitGatewayId:
+        default: Transit Gateway the VPC is attached to (centralised egress)
+      AvailabilityZones:
+        default: The two Availability Zones the ALB spans (first one hosts the EC2 compute)
+      PublicSubnetCidrs:
+        default: Public ALB subnet CIDRs, one per Availability Zone above
+      TargetPort:
+        default: Port the ALB forwards to on the WordPress instances
+      PrivateHostedZoneName:
+        default: Name of the Route 53 private hosted zone (internal names only)
+      CertificateDomainName:
+        default: Wildcard domain for the ACM certificate, e.g. *.example.ac.uk (blank = none yet)
+      AlarmEmailAddress:
+        default: Email address subscribed to critical alarms (blank = none yet)
+
+Parameters:
+  ApplicationName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{1,24}$'
+    ConstraintDescription: 2-25 characters - lowercase letters, digits and hyphens, starting with a letter.
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, stage, prod]
+
+  TemplateBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /EAS-IA/infrastructure/template-bucket
+    Description: >-
+      SSM parameter holding the name of the shared S3 bucket that nested stack
+      templates are synced to by buildspec.yml.
+
+  TemplatePrefix:
+    Type: String
+    Description: >-
+      Key prefix within TemplateBucket the nested templates are synced under.
+      Injected by buildspec-create-changeset.yml - do not set it in the params file.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Created by the Customer through its LZA templates. This stack never creates or modifies the VPC itself.
+
+  VpcCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-4])$'
+    ConstraintDescription: An IPv4 CIDR between /16 and /24.
+    Description: >-
+      Primary CIDR of the VPC. The server network ACLs deny this range explicitly
+      so that no WordPress server can reach another server's subnets.
+
+  TransitGatewayId:
+    Type: String
+    AllowedPattern: '^tgw-[0-9a-f]{8,17}$'
+    ConstraintDescription: A Transit Gateway ID (tgw-...). Note this is the gateway ID, not the attachment ID (tgw-attach-...).
+    Description: >-
+      The Customer's Transit Gateway. The LZA has already attached the VPC to
+      it through the three Transit Gateway subnets, which this solution uses
+      but does not create, change or need the IDs of. Exported for the server
+      stacks' App subnet default route (centralised egress).
+
+  AvailabilityZones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+    Description: >-
+      Exactly two AZs, e.g. eu-west-2a,eu-west-2b. An ALB needs subnets in two
+      AZs; every server's compute must be placed in one of these two AZs.
+
+  PublicSubnetCidrs:
+    Type: CommaDelimitedList
+    Description: >-
+      Exactly two CIDRs (/27 or larger - /26 recommended), matching the order of
+      AvailabilityZones, carved from unallocated space in VpcCidr.
+
+  TargetPort:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    Description: TLS terminates at the ALB, which forwards plain HTTP to the instances on this port (D3.3).
+
+  PrivateHostedZoneName:
+    Type: String
+    Default: nls-wordpress.internal
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: Each server gets an A record <ServerName>.<this zone> pointing at its private IP.
+
+  CertificateDomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(\*\.[a-z0-9.-]+)?$'
+    Description: >-
+      Blank creates no certificate. When set, ACM requests a DNS-validated
+      wildcard certificate and this stack WAITS until it is issued: the Customer
+      must create the validation CNAME (shown in the ACM console and the stack
+      events) on its external DNS while the pipeline's Shared execute step is
+      running, and keep it in place for automatic renewal. Copy the
+      CertificateArn output into each server params file.
+
+  AlarmEmailAddress:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([^@\s]+@[^@\s]+\.[^@\s]+)?$'
+    Description: Optional. The recipient must confirm the subscription email from AWS.
+
+Conditions:
+  HasCertificateDomain: !Not [!Equals [!Ref CertificateDomainName, '']]
+
+# Nested stacks use DeletionPolicy RetainExceptOnCreate (Retain, except that a
+# stack whose very first creation fails is cleaned up rather than orphaned - an
+# orphaned network stack would hold its CIDRs and block the retry).
+# UpdateReplacePolicy has no such option and is Retain.
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/shared-network.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        VpcId: !Ref VpcId
+        VpcCidr: !Ref VpcCidr
+        AvailabilityZoneA: !Select [0, !Ref AvailabilityZones]
+        AvailabilityZoneB: !Select [1, !Ref AvailabilityZones]
+        PublicSubnetCidrA: !Select [0, !Ref PublicSubnetCidrs]
+        PublicSubnetCidrB: !Select [1, !Ref PublicSubnetCidrs]
+        TargetPort: !Ref TargetPort
+      Tags:
+        - Key: Deliverable
+          Value: D3.2
+
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/shared-security.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        AlarmEmailAddress: !Ref AlarmEmailAddress
+      Tags:
+        - Key: Deliverable
+          Value: D3.6-D3.7
+
+  DnsStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/shared-dns.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        VpcId: !Ref VpcId
+        PrivateHostedZoneName: !Ref PrivateHostedZoneName
+      Tags:
+        - Key: Deliverable
+          Value: D3.3
+
+  # Held in the root stack rather than a nested one so that waiting for the
+  # Customer's DNS validation is bounded only by the pipeline step, not by a
+  # nested stack timeout.
+  WildcardCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCertificateDomain
+    Properties:
+      DomainName: !Ref CertificateDomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-wildcard'
+        - Key: Deliverable
+          Value: D3.3
+
+# Exports are consumed by cf-templates/server.yml with Fn::ImportValue. An
+# exported value cannot change while a server stack imports it, so these are
+# limited to values fixed for the life of the environment.
+Outputs:
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-VpcId'
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-VpcCidr'
+  TransitGatewayId:
+    Value: !Ref TransitGatewayId
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-TransitGatewayId'
+  PublicSubnetIds:
+    Description: Public ALB subnets (AZ A, AZ B) - for the per-server ALBs (D3.3)
+    Value: !GetAtt NetworkStack.Outputs.PublicSubnetIds
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-PublicSubnetIds'
+  PublicSubnetCidrA:
+    Value: !Select [0, !Ref PublicSubnetCidrs]
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-PublicSubnetCidrA'
+  PublicSubnetCidrB:
+    Value: !Select [1, !Ref PublicSubnetCidrs]
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-PublicSubnetCidrB'
+  KmsKeyArn:
+    Value: !GetAtt SecurityStack.Outputs.KmsKeyArn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-KmsKeyArn'
+  AlarmTopicArn:
+    Value: !GetAtt SecurityStack.Outputs.AlarmTopicArn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-AlarmTopicArn'
+  CloudWatchAgentDocumentName:
+    Value: !GetAtt SecurityStack.Outputs.CloudWatchAgentDocumentName
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-CloudWatchAgentDocumentName'
+  PrivateHostedZoneId:
+    Value: !GetAtt DnsStack.Outputs.PrivateHostedZoneId
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-PrivateHostedZoneId'
+  PrivateHostedZoneName:
+    Value: !Ref PrivateHostedZoneName
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-shared-PrivateHostedZoneName'
+  CertificateArn:
+    Condition: HasCertificateDomain
+    Description: Copy into CertificateArn in each params/<env>/server-NN.json once issued
+    Value: !Ref WildcardCertificate
+  InternetGatewayId:
+    Value: !GetAtt NetworkStack.Outputs.InternetGatewayId
+  PublicNetworkAclId:
+    Value: !GetAtt NetworkStack.Outputs.PublicNetworkAclId
+  KmsKeyAlias:
+    Value: !GetAtt SecurityStack.Outputs.KmsKeyAlias

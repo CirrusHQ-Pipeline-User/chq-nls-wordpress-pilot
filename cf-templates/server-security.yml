@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - per-server baseline security groups (nested in server.yml,
+  Deliverable D3.2; D3.5 data tier group; finalised under D3.6). Chained
+  ALB -> EC2 -> DB, each tier accepting traffic only from the security group in
+  front of it.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  ServerName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  AppSubnetCidr:
+    Type: String
+  DataSubnetCidr:
+    Type: String
+  TargetPort:
+    Type: Number
+  DbPort:
+    Type: Number
+  AlbIngressCidr:
+    Type: String
+
+# Egress rules use the server's own subnet CIDRs rather than security-group
+# references. Referencing EC2 from the ALB group (and DB from the EC2 group)
+# while ingress references run the other way would be circular, and breaking
+# the cycle needs standalone AWS::EC2::SecurityGroupEgress resources, which
+# CloudFormation does not support mixing with inline rules on the same group.
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ApplicationName}-${Environment}-${ServerName} ALB - HTTP/HTTPS in, TargetPort out to the App subnet'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AlbIngressCidr
+          Description: HTTPS from clients
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AlbIngressCidr
+          Description: HTTP from clients (redirected to HTTPS)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref TargetPort
+          ToPort: !Ref TargetPort
+          CidrIp: !Ref AppSubnetCidr
+          Description: To this server's instance - traffic and health checks
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-alb-sg'
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ApplicationName}-${Environment}-${ServerName} EC2 - TargetPort from this server''s ALB only'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref TargetPort
+          ToPort: !Ref TargetPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: From this server's ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS out via the Transit Gateway - SSM, CloudWatch, updates
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP out via the Transit Gateway - Debian package mirrors
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          CidrIp: !Ref DataSubnetCidr
+          Description: To this server's Data subnet (future external database)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-ec2-sg'
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ApplicationName}-${Environment}-${ServerName} DB - DbPort from this server''s EC2 only'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+          Description: From this server's EC2 instance
+      SecurityGroupEgress:
+        # Replaces the default allow-all egress rule. A database needs no outbound access.
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 127.0.0.1/32
+          Description: No outbound access
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-db-sg'
+
+Outputs:
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+  Ec2SecurityGroupId:
+    Value: !Ref Ec2SecurityGroup
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup

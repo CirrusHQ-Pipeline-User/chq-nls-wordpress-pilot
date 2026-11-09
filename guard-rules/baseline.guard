@@ -1,0 +1,88 @@
+let s3_buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+let bucket_policies = Resources.*[ Type == 'AWS::S3::BucketPolicy' ]
+let log_groups = Resources.*[ Type == 'AWS::Logs::LogGroup' ]
+let kms_keys = Resources.*[ Type == 'AWS::KMS::Key' ]
+let sns_topics = Resources.*[ Type == 'AWS::SNS::Topic' ]
+let roles_not_used_by_cloudformation = Resources.*[
+    Type == 'AWS::IAM::Role'
+    Properties.Policies exists
+    Properties.AssumeRolePolicyDocument.Statement[*].Principal.Service != 'cloudformation.amazonaws.com'
+]
+let managed_policies = Resources.*[ Type == 'AWS::IAM::ManagedPolicy' ]
+let security_groups = Resources.*[
+    Type == 'AWS::EC2::SecurityGroup'
+    Properties.SecurityGroupIngress exists
+]
+let codebuild_projects = Resources.*[ Type == 'AWS::CodeBuild::Project' ]
+let pipelines = Resources.*[ Type == 'AWS::CodePipeline::Pipeline' ]
+
+rule s3_buckets_block_public_access when %s3_buckets !empty {
+    %s3_buckets.Properties.PublicAccessBlockConfiguration {
+        BlockPublicAcls == true
+        BlockPublicPolicy == true
+        IgnorePublicAcls == true
+        RestrictPublicBuckets == true
+    }
+}
+
+rule s3_buckets_encrypted_and_retained when %s3_buckets !empty {
+    %s3_buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm in ['aws:kms', 'AES256']
+    %s3_buckets.DeletionPolicy in ['Retain', 'RetainExceptOnCreate']
+}
+
+rule s3_bucket_policies_deny_insecure_transport when %bucket_policies !empty {
+    %bucket_policies.Properties.PolicyDocument.Statement[
+        Effect == 'Deny'
+        Condition.Bool.'aws:SecureTransport' in [false, 'false']
+    ] !empty
+}
+
+rule log_groups_encrypted_with_retention when %log_groups !empty {
+    %log_groups.Properties.KmsKeyId exists
+    %log_groups.Properties.RetentionInDays exists
+}
+
+rule kms_keys_rotated_and_retained when %kms_keys !empty {
+    %kms_keys.Properties.EnableKeyRotation == true
+    %kms_keys.DeletionPolicy == 'Retain'
+    %kms_keys.UpdateReplacePolicy == 'Retain'
+}
+
+rule kms_key_policies_condition_open_principals when %kms_keys !empty {
+    let open_statements = %kms_keys.Properties.KeyPolicy.Statement[ Principal.AWS == '*' ]
+    when %open_statements !empty {
+        %open_statements.Condition exists
+    }
+}
+
+rule sns_topics_encrypted when %sns_topics !empty {
+    %sns_topics.Properties.KmsMasterKeyId exists
+}
+
+rule iam_no_full_admin_outside_cloudformation_roles when %roles_not_used_by_cloudformation !empty {
+    %roles_not_used_by_cloudformation.Properties.Policies[*].PolicyDocument.Statement[ Effect == 'Allow' some Action[*] == '*' ] empty
+    %roles_not_used_by_cloudformation.Properties.Policies[*].PolicyDocument.Statement[ NotAction exists ] empty
+}
+
+rule iam_managed_policies_no_full_admin when %managed_policies !empty {
+    %managed_policies.Properties.PolicyDocument.Statement[ Effect == 'Allow' some Action[*] == '*' ] empty
+    %managed_policies.Properties.PolicyDocument.Statement[ NotAction exists ] empty
+}
+
+rule security_groups_no_all_traffic_ingress when %security_groups !empty {
+    %security_groups.Properties.SecurityGroupIngress[ IpProtocol in ['-1', -1] ] empty
+    %security_groups.Properties.SecurityGroupIngress[ CidrIp == '0.0.0.0/0' ] empty
+    %security_groups.Properties.SecurityGroupIngress[ CidrIpv6 == '::/0' ] empty
+}
+
+rule no_nat_gateways {
+    Resources.*[ Type == 'AWS::EC2::NatGateway' ] empty
+}
+
+rule codebuild_projects_encrypted when %codebuild_projects !empty {
+    %codebuild_projects.Properties.EncryptionKey exists
+}
+
+rule pipelines_encrypt_artifacts when %pipelines !empty {
+    %pipelines.Properties.ArtifactStore.EncryptionKey exists
+}

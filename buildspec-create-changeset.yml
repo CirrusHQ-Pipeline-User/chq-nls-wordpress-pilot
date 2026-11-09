@@ -1,0 +1,130 @@
+version: 0.2
+
+# Creates one change set per parameter file, one root stack per file:
+#   params/${ENVIRONMENT}/<name>.json  ->  stack ${STACK_PREFIX}-<name>
+# Each file names its root template (cf-templates/<Template>) and holds its
+# Parameters and Tags. PARAM_FILES is set per pipeline action (e.g. shared.json,
+# or server-*.json) so the shared stack is created and executed before any
+# server stack that imports its exports.
+#
+# Environment: ENVIRONMENT, STACK_PREFIX, PARAM_FILES, TEMPLATE_BUCKET,
+#              TEMPLATE_PREFIX, CFN_ROLE_ARN
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        shopt -s nullglob
+
+        # Split PARAM_FILES into patterns without expanding them against the
+        # repo root, then expand each one inside params/$ENVIRONMENT.
+        set -f; PATTERNS=($PARAM_FILES); set +f
+        FILES=()
+        for pattern in "${PATTERNS[@]}"; do
+          for f in params/"$ENVIRONMENT"/$pattern; do FILES+=("$f"); done
+        done
+        if [ ${#FILES[@]} -eq 0 ]; then
+          echo "No parameter files match '$PARAM_FILES' in params/$ENVIRONMENT - nothing to deploy"
+          exit 1
+        fi
+
+        SUMMARY='Changes[].ResourceChange.{Action:Action,Resource:LogicalResourceId,Type:ResourceType,Replacement:Replacement}'
+
+        for PARAM_FILE in "${FILES[@]}"; do
+          STACK_NAME="${STACK_PREFIX}-$(basename "$PARAM_FILE" .json)"
+          CHANGE_SET_NAME="$STACK_NAME"
+          echo "================ $STACK_NAME ($PARAM_FILE)"
+
+          TEMPLATE=$(python3 - "$PARAM_FILE" <<'EOF'
+        import json, os, sys
+        config = json.load(open(sys.argv[1]))
+        params = dict(config["Parameters"])
+        params["TemplatePrefix"] = os.environ["TEMPLATE_PREFIX"]
+        json.dump([{"ParameterKey": k, "ParameterValue": v} for k, v in params.items()],
+                  open("/tmp/parameters.json", "w"))
+        json.dump([{"Key": k, "Value": v} for k, v in config.get("Tags", {}).items()],
+                  open("/tmp/tags.json", "w"))
+        print(config["Template"])
+        EOF
+          )
+
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+
+          case "$STATUS" in
+            ROLLBACK_COMPLETE)
+              echo "$STACK_NAME is $STATUS after a failed first deployment - deleting it so it can be created again"
+              aws cloudformation delete-stack --stack-name "$STACK_NAME" --role-arn "$CFN_ROLE_ARN"
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+              STATUS=NONE
+              ;;
+            NONE|REVIEW_IN_PROGRESS|*_COMPLETE)
+              ;;
+            *)
+              echo "$STACK_NAME is $STATUS - resolve it in the CloudFormation console, then release the pipeline again"
+              exit 1
+              ;;
+          esac
+
+          if [ "$STATUS" = NONE ] || [ "$STATUS" = REVIEW_IN_PROGRESS ]; then
+            CHANGE_SET_TYPE=CREATE
+            NESTED=""
+          else
+            CHANGE_SET_TYPE=UPDATE
+            NESTED="--include-nested-stacks"
+          fi
+
+          if aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+              --change-set-name "$CHANGE_SET_NAME" >/dev/null 2>&1; then
+            echo "Removing the previous change set $CHANGE_SET_NAME"
+            aws cloudformation delete-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGE_SET_NAME"
+            while aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+                --change-set-name "$CHANGE_SET_NAME" >/dev/null 2>&1; do
+              sleep 5
+            done
+          fi
+
+          TEMPLATE_URL="https://${TEMPLATE_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${TEMPLATE_PREFIX}/${TEMPLATE}"
+          echo "Creating $CHANGE_SET_TYPE change set $CHANGE_SET_NAME on $STACK_NAME from $TEMPLATE_URL"
+          aws cloudformation create-change-set \
+            --stack-name "$STACK_NAME" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --change-set-type "$CHANGE_SET_TYPE" \
+            --template-url "$TEMPLATE_URL" \
+            --parameters file:///tmp/parameters.json \
+            --tags file:///tmp/tags.json \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --role-arn "$CFN_ROLE_ARN" \
+            $NESTED > /dev/null
+
+          if aws cloudformation wait change-set-create-complete \
+              --stack-name "$STACK_NAME" --change-set-name "$CHANGE_SET_NAME" 2>/dev/null; then
+            echo "Change set ready for review - $STACK_NAME:"
+            aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+              --change-set-name "$CHANGE_SET_NAME" --query "$SUMMARY" --output table
+
+            for NESTED_ID in $(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+                --change-set-name "$CHANGE_SET_NAME" \
+                --query 'Changes[?ResourceChange.ChangeSetId].ResourceChange.ChangeSetId' --output text); do
+              echo "Nested stack $(aws cloudformation describe-change-set --change-set-name "$NESTED_ID" --query StackName --output text):"
+              aws cloudformation describe-change-set --change-set-name "$NESTED_ID" --query "$SUMMARY" --output table
+            done
+          else
+            REASON=$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+              --change-set-name "$CHANGE_SET_NAME" --query StatusReason --output text)
+            case "$REASON" in
+              *"didn't contain changes"*|*"No updates are to be performed"*)
+                echo "No changes to deploy - removing the empty change set"
+                aws cloudformation delete-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGE_SET_NAME"
+                ;;
+              *)
+                echo "Change set creation failed: $REASON"
+                exit 1
+                ;;
+            esac
+          fi
+        done

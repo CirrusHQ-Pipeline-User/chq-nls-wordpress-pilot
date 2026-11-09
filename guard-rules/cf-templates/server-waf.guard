@@ -1,0 +1,26 @@
+let managed_rule_names = Resources.WebAcl.Properties.Rules[*].Statement.ManagedRuleGroupStatement.Name
+
+# D3.3 - the SoW rule set is present
+rule web_acl_has_required_managed_rules {
+    some %managed_rule_names == 'AWSManagedRulesAmazonIpReputationList'
+    some %managed_rule_names == 'AWSManagedRulesCommonRuleSet'
+    some %managed_rule_names == 'AWSManagedRulesKnownBadInputsRuleSet'
+    some %managed_rule_names == 'AWSManagedRulesSQLiRuleSet'
+    some %managed_rule_names == 'AWSManagedRulesWordPressRuleSet'
+}
+
+# D3.3 - rate limiting
+rule web_acl_has_rate_limit {
+    Resources.WebAcl.Properties.Rules[ Name == 'RateLimitPerIp' ] !empty
+}
+
+# D3.8 - wp-admin restricted to approved IPs
+rule web_acl_restricts_admin_paths {
+    Resources.WebAcl.Properties.Rules[ Name == 'AdminPathsFromApprovedIpsOnly' ] !empty
+}
+
+# D3.3 - the web ACL is associated with the ALB and logs
+rule web_acl_associated_and_logging {
+    Resources.*[ Type == 'AWS::WAFv2::WebACLAssociation' ] !empty
+    Resources.*[ Type == 'AWS::WAFv2::LoggingConfiguration' ] !empty
+}

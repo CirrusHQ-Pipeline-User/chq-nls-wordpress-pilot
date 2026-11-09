@@ -1,0 +1,25 @@
+let kms_keys = Resources.*[ Type == 'AWS::KMS::Key' ]
+let key_service_statements = Resources.*[ Type == 'AWS::KMS::Key' ].Properties.KeyPolicy.Statement[ Principal.Service exists ]
+
+# D3.6 - one customer managed key, with an alias
+rule workload_key_has_alias {
+    %kms_keys !empty
+    Resources.*[ Type == 'AWS::KMS::Alias' ] !empty
+}
+
+# Service principals may use the key only under a scoping condition
+rule key_service_principals_conditioned when %key_service_statements !empty {
+    %key_service_statements.Condition exists
+}
+
+# D3.7 - the alarm topic is encrypted with the workload key
+rule alarm_topic_encrypted_with_workload_key {
+    Resources.AlarmTopic.Properties.KmsMasterKeyId.Ref == 'WorkloadKey'
+}
+
+# D3.7 - the agent document must keep its name across updates (it is exported)
+rule cloudwatch_agent_document_updated_in_place {
+    Resources.*[ Type == 'AWS::SSM::Document' ] {
+        Properties.UpdateMethod == 'NewVersion'
+    }
+}

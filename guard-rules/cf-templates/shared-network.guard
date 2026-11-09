@@ -1,0 +1,51 @@
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
+let default_routes = Resources.*[
+    Type == 'AWS::EC2::Route'
+    Properties.DestinationCidrBlock == '0.0.0.0/0'
+]
+
+# D3.2 - the VPC belongs to the Customer's LZA and is never created here
+rule no_vpc_created {
+    Resources.*[ Type == 'AWS::EC2::VPC' ] empty
+}
+
+rule public_subnets_get_no_public_ips {
+    %subnets !empty
+    %subnets.Properties.MapPublicIpOnLaunch == false
+}
+
+# D3.2 - the only default route is public subnets -> Internet Gateway
+rule default_route_only_from_public_route_table_to_internet_gateway when %default_routes !empty {
+    %default_routes.Properties.RouteTableId.Ref == 'PublicRouteTable'
+    %default_routes.Properties.GatewayId exists
+    %default_routes.Properties.NatGatewayId not exists
+    %default_routes.Properties.TransitGatewayId not exists
+}
+
+# D3.2 - the LZA VPC has no Internet Gateway, so this stack creates and attaches one
+rule internet_gateway_created_and_attached {
+    Resources.*[ Type == 'AWS::EC2::InternetGateway' ] !empty
+    Resources.*[
+        Type == 'AWS::EC2::VPCGatewayAttachment'
+        Properties.InternetGatewayId.Ref == 'InternetGateway'
+    ] !empty
+}
+
+# D3.2 - no NAT Gateway (baseline) or Elastic IP in the WordPress account
+rule no_elastic_ips {
+    Resources.*[ Type == 'AWS::EC2::EIP' ] empty
+}
+
+# D3.2 - 1x network ACL for the shared public ALB subnets
+rule public_subnets_use_public_network_acl {
+    Resources.*[
+        Type == 'AWS::EC2::SubnetNetworkAclAssociation'
+        Properties.SubnetId.Ref == 'PublicSubnetA'
+        Properties.NetworkAclId.Ref == 'PublicNetworkAcl'
+    ] !empty
+    Resources.*[
+        Type == 'AWS::EC2::SubnetNetworkAclAssociation'
+        Properties.SubnetId.Ref == 'PublicSubnetB'
+        Properties.NetworkAclId.Ref == 'PublicNetworkAcl'
+    ] !empty
+}

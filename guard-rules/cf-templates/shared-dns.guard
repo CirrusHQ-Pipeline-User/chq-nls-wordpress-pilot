@@ -1,0 +1,9 @@
+let hosted_zones = Resources.*[ Type == 'AWS::Route53::HostedZone' ]
+
+# D3.3 - the hosted zone is private (associated with the VPC). Public DNS
+# stays on the Customer's external platform.
+rule hosted_zone_is_private {
+    %hosted_zones !empty
+    %hosted_zones.Properties.VPCs exists
+    %hosted_zones.Properties.VPCs !empty
+}

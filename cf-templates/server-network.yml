@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - per-server networking (nested in server.yml, Deliverable D3.2).
+  One App and one Data private subnet in the compute AZ of the Customer's
+  existing VPC, their route tables, and a dedicated network ACL on each so this
+  server is isolated at the subnet boundary from every other WordPress server.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  ServerName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  TransitGatewayId:
+    Type: String
+  PublicSubnetCidrA:
+    Type: String
+  PublicSubnetCidrB:
+    Type: String
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  AppSubnetCidr:
+    Type: String
+  DataSubnetCidr:
+    Type: String
+  TargetPort:
+    Type: Number
+  DbPort:
+    Type: Number
+
+Resources:
+  # ------------------------------------------------------------------ App (private) subnet
+  AppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref AppSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-app'
+        - Key: Tier
+          Value: app
+
+  # Outbound internet (OS and plugin updates, SSM, CloudWatch) goes over the
+  # Transit Gateway to the centralised NAT Gateways in the Network account.
+  # There is no route from the internet to this subnet.
+  AppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-app-rt'
+
+  AppDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayId: !Ref TransitGatewayId
+
+  AppSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet
+      RouteTableId: !Ref AppRouteTable
+
+  # ------------------------------------------------------------------ Data (private) subnet
+  DataSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref DataSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-data'
+        - Key: Tier
+          Value: data
+
+  # Local route only - no path to the Internet Gateway or the Transit Gateway.
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-data-rt'
+
+  DataSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet
+      RouteTableId: !Ref DataRouteTable
+
+  # ------------------------------------------------------------------ App network ACL
+  # Network ACLs are evaluated in rule-number order and are stateless.
+  #
+  # The App subnet must accept ephemeral return traffic from the internet
+  # (0.0.0.0/0), and 0.0.0.0/0 also contains every other server's subnets. The
+  # implicit deny alone therefore cannot isolate servers: rule 200 explicitly
+  # denies the whole VPC CIDR in both directions *before* the internet rules
+  # (300+), after the few intra-VPC flows this server needs (100-120).
+  #
+  # Inbound  100/110  TargetPort from the public ALB subnets (traffic + health checks)
+  #          120      ephemeral return traffic from this server's Data subnet
+  #          200      DENY all from the VPC CIDR (other servers, TGW subnets, etc.)
+  #          300      ephemeral return traffic from the internet (egress via TGW)
+  # Outbound 100/110  ephemeral responses to the ALB subnets
+  #          120      DbPort to this server's Data subnet
+  #          200      DENY all to the VPC CIDR
+  #          300/310  HTTPS / HTTP to the internet via the Transit Gateway
+  #
+  # Route 53 Resolver, instance metadata and Amazon Time Sync traffic is not
+  # filtered by network ACLs, so DNS and NTP need no rules.
+  AppNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-app-nacl'
+
+  AppInTargetPortFromAlbA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 100
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref PublicSubnetCidrA
+      PortRange: { From: !Ref TargetPort, To: !Ref TargetPort }
+
+  AppInTargetPortFromAlbB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 110
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref PublicSubnetCidrB
+      PortRange: { From: !Ref TargetPort, To: !Ref TargetPort }
+
+  AppInEphemeralFromData:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 120
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref DataSubnetCidr
+      PortRange: { From: 1024, To: 65535 }
+
+  AppInDenyVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 200
+      Egress: false
+      Protocol: -1
+      RuleAction: deny
+      CidrBlock: !Ref VpcCidr
+
+  AppInEphemeralFromInternet:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 300
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 1024, To: 65535 }
+
+  AppOutEphemeralToAlbA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 100
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref PublicSubnetCidrA
+      PortRange: { From: 1024, To: 65535 }
+
+  AppOutEphemeralToAlbB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 110
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref PublicSubnetCidrB
+      PortRange: { From: 1024, To: 65535 }
+
+  AppOutDbToData:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 120
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref DataSubnetCidr
+      PortRange: { From: !Ref DbPort, To: !Ref DbPort }
+
+  AppOutDenyVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 200
+      Egress: true
+      Protocol: -1
+      RuleAction: deny
+      CidrBlock: !Ref VpcCidr
+
+  AppOutHttpsToInternet:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 300
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 443, To: 443 }
+
+  AppOutHttpToInternet:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNetworkAcl
+      RuleNumber: 310
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 80, To: 80 }
+
+  AppSubnetNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet
+      NetworkAclId: !Ref AppNetworkAcl
+
+  # ------------------------------------------------------------------ Data network ACL
+  # Inbound  100  DbPort from this server's App subnet only
+  # Outbound 100  ephemeral responses to this server's App subnet only
+  # Everything else, including all other servers, hits the implicit deny.
+  DataNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-data-nacl'
+
+  DataInDbFromApp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DataNetworkAcl
+      RuleNumber: 100
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref AppSubnetCidr
+      PortRange: { From: !Ref DbPort, To: !Ref DbPort }
+
+  DataOutEphemeralToApp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DataNetworkAcl
+      RuleNumber: 100
+      Egress: true
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref AppSubnetCidr
+      PortRange: { From: 1024, To: 65535 }
+
+  DataSubnetNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet
+      NetworkAclId: !Ref DataNetworkAcl
+
+Outputs:
+  AppSubnetId:
+    Value: !Ref AppSubnet
+  DataSubnetId:
+    Value: !Ref DataSubnet
+  AppRouteTableId:
+    Value: !Ref AppRouteTable
+  DataRouteTableId:
+    Value: !Ref DataRouteTable
+  AppNetworkAclId:
+    Value: !Ref AppNetworkAcl
+  DataNetworkAclId:
+    Value: !Ref DataNetworkAcl

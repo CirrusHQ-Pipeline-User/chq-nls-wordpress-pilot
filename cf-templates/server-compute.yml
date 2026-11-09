@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - compute tier for one WordPress server (nested in server.yml,
+  Deliverable D3.4; D3.6 secret). A single EC2 instance in the server's private
+  App subnet, EBS encrypted with the workload CMK, IMDSv2, an SSM-only
+  instance role and no SSH key. Until the server is migrated it runs a basic
+  placeholder image that answers the ALB health check; switching AmiId to the
+  migrated AMI (D3.9 / D3.10) replaces it.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  ServerName:
+    Type: String
+  AppSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  Ec2SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  KmsKeyArn:
+    Type: String
+  AmiId:
+    Type: AWS::EC2::Image::Id
+  InstanceType:
+    Type: String
+  RootDeviceName:
+    Type: String
+    Default: /dev/xvda
+  RootVolumeSize:
+    Type: Number
+    Default: 0
+  PlaceholderInstance:
+    Type: String
+    AllowedValues: ['true', 'false']
+  RequireImdsv2:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  TargetPort:
+    Type: Number
+  PrivateHostedZoneId:
+    Type: String
+  PrivateHostedZoneName:
+    Type: String
+
+Conditions:
+  IsPlaceholder: !Equals [!Ref PlaceholderInstance, 'true']
+  HasRootVolumeSize: !Not [!Equals [!Ref RootVolumeSize, 0]]
+  EnforceImdsv2: !Equals [!Ref RequireImdsv2, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ Instance identity (D3.4)
+  # SSM for operating-system access, and the CloudWatch agent policy the
+  # D3.7 agent needs to publish metrics and logs. No other permissions.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub '${ApplicationName}-${Environment}-${ServerName} instance role - SSM access and CloudWatch agent only'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}-instance-role'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ------------------------------------------------------------------ WordPress server (D3.4)
+  # Stateful: the WordPress files and co-located database live on this
+  # instance's volumes, so a replacement keeps the old instance
+  # (UpdateReplacePolicy Retain) and a migrated instance has termination
+  # protection. Changing AmiId, InstanceType family or the placeholder flag
+  # replaces it - expected when moving from the placeholder to the migrated AMI.
+  Instance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref AppSubnetId
+      SecurityGroupIds: [!Ref Ec2SecurityGroupId]
+      IamInstanceProfile: !Ref InstanceProfile
+      DisableApiTermination: !If [IsPlaceholder, false, true]
+      Monitoring: false
+      PropagateTagsToVolumeOnCreation: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: !If [EnforceImdsv2, required, optional]
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: !Ref RootDeviceName
+          Ebs:
+            Encrypted: true
+            KmsKeyId: !Ref KmsKeyArn
+            VolumeType: gp3
+            VolumeSize: !If [HasRootVolumeSize, !Ref RootVolumeSize, !Ref 'AWS::NoValue']
+            DeleteOnTermination: true
+      # Only the placeholder gets user data. A migrated server already has
+      # its software (and the SSM Agent, installed by the Customer before the
+      # AMI is taken), and cloud-init would run user data again on its first
+      # boot as a new instance.
+      UserData: !If
+        - IsPlaceholder
+        - Fn::Base64: !Sub |
+            #!/bin/bash
+            # Placeholder until this server is migrated: answers the ALB health
+            # check on port ${TargetPort} and installs the SSM Agent (Debian
+            # images do not include it) so Session Manager and the CloudWatch
+            # agent association work.
+            set -euxo pipefail
+            exec > >(tee -a /var/log/placeholder-bootstrap.log) 2>&1
+
+            mkdir -p /var/www/placeholder
+            cat > /var/www/placeholder/index.html <<'HTML'
+            <!doctype html><html><head><title>${ServerName}</title></head>
+            <body><h1>${ApplicationName} ${Environment} ${ServerName}</h1>
+            <p>Infrastructure placeholder - this server has not been migrated yet.</p></body></html>
+            HTML
+
+            cat > /etc/systemd/system/placeholder-web.service <<'UNIT'
+            [Unit]
+            Description=Placeholder web server for ALB health checks
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server ${TargetPort} --bind 0.0.0.0 --directory /var/www/placeholder
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now placeholder-web.service
+
+            # SSM Agent from the regional bucket, through the Transit Gateway egress
+            cd /tmp
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+                https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/debian_amd64/amazon-ssm-agent.deb \
+                /tmp/amazon-ssm-agent.deb && break
+              echo "SSM Agent download attempt $attempt failed - retrying"; sleep 30
+            done
+            dpkg -i /tmp/amazon-ssm-agent.deb
+            systemctl enable --now amazon-ssm-agent
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-${ServerName}'
+        - Key: WordPressServer
+          Value: !Ref ServerName
+        - Key: Placeholder
+          Value: !Ref PlaceholderInstance
+
+  # Internal name in the private hosted zone (D3.3), e.g. wp01.nls-wordpress.internal
+  InstanceDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Sub '${ServerName}.${PrivateHostedZoneName}'
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt Instance.PrivateIp
+
+  # ------------------------------------------------------------------ Credentials store (D3.6)
+  # A secure placeholder: Secrets Manager generates a random value now, and
+  # the Customer replaces it with the WordPress database / application
+  # credentials after migration.
+  WordPressSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub '${ApplicationName}/${Environment}/${ServerName}/wordpress'
+      Description: !Sub 'WordPress database and application credentials for ${ServerName} - placeholder until populated by the Customer'
+      KmsKeyId: !Ref KmsKeyArn
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"placeholder"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: WordPressServer
+          Value: !Ref ServerName
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  InstancePrivateIp:
+    Value: !GetAtt Instance.PrivateIp
+  InstanceDnsName:
+    Value: !Sub '${ServerName}.${PrivateHostedZoneName}'
+  InstanceRoleArn:
+    Value: !GetAtt InstanceRole.Arn
+  WordPressSecretArn:
+    Value: !Ref WordPressSecret

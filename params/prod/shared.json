@@ -1,0 +1,21 @@
+{
+  "Template": "shared.yml",
+  "Parameters": {
+    "ApplicationName": "nls-wordpress",
+    "Environment": "prod",
+    "VpcId": "vpc-03da0987c9a2e9199",
+    "VpcCidr": "10.149.12.0/22",
+    "TransitGatewayId": "tgw-022f9631ce10e9ca8",
+    "AvailabilityZones": "eu-west-2a,eu-west-2b",
+    "PublicSubnetCidrs": "10.149.12.64/26,10.149.12.128/26",
+    "TargetPort": "80",
+    "PrivateHostedZoneName": "nls-wordpress.internal",
+    "CertificateDomainName": "",
+    "AlarmEmailAddress": ""
+  },
+  "Tags": {
+    "Environment": "prod",
+    "ApplicationName": "nls-wordpress",
+    "aws-apn-id": "pc:6riim3fafb0fpeqecyjw2qmwo"
+  }
+}

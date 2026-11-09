@@ -1,0 +1,21 @@
+{
+  "Parameters": {
+    "Environment": "prod",
+    "ConnectionArn": "Update",
+    "FullRepositoryId": "Update",
+    "PipelineName": "nls-wordpress-pipeline-prod",
+    "ApplicationName": "nls-wordpress",
+    "ApprovalForCloudformationStage": "true",
+    "MainPipelineChangesOnPush": "true",
+    "TemplatePrefix": "nls-wordpress/cf-templates",
+    "BuildLogRetentionInDays": "90",
+    "PipelineBuilderName": "nls-wordpress-infra-pipelinebuilder-prod",
+    "BranchName": "main",
+    "PipelineNotificationEmail": ""
+  },
+  "Tags": {
+    "Environment": "prod",
+    "aws-apn-id": "pc:6riim3fafb0fpeqecyjw2qmwo",
+    "ApplicationName": "nls-wordpress"
+  }
+}

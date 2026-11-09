@@ -1,0 +1,466 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - reference architecture for one WordPress server (root).
+  Deployed once per server (up to 4) by the main pipeline, one stack and one
+  params/<env>/server-NN.json file per server (Deliverables D3.1 / D3.10):
+  subnets and network ACLs (D3.2), security groups (D3.2 / D3.6), the EC2
+  instance and credentials secret (D3.4 / D3.6), the ALB (D3.3), AWS WAF and
+  Shield Advanced (D3.3 / D3.8) and monitoring (D3.7). Imports the VPC, Transit
+  Gateway, public subnets, KMS key, SNS topic and private hosted zone from the
+  shared stack, which the pipeline deploys first.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General
+        Parameters:
+          - ApplicationName
+          - Environment
+          - ServerName
+          - TemplateBucket
+          - TemplatePrefix
+      - Label:
+          default: 'Deliverable D3.2 - Server subnets (single AZ now, second AZ reserved)'
+        Parameters:
+          - AvailabilityZone
+          - AppSubnetCidr
+          - DataSubnetCidr
+          - ReservedAppSubnetCidrSecondAz
+          - ReservedDataSubnetCidrSecondAz
+          - TargetPort
+          - DbPort
+          - AlbIngressCidr
+      - Label:
+          default: 'Deliverable D3.4 - Compute'
+        Parameters:
+          - AmiId
+          - PlaceholderInstance
+          - InstanceType
+          - RootDeviceName
+          - RootVolumeSize
+          - RequireImdsv2
+      - Label:
+          default: 'Deliverable D3.3 - Load balancer and TLS'
+        Parameters:
+          - CertificateArn
+          - HealthCheckPath
+          - HealthCheckMatcher
+      - Label:
+          default: 'Deliverables D3.3 / D3.8 - AWS WAF and Shield Advanced'
+        Parameters:
+          - WafRuleAction
+          - AdminAllowedCidrs
+          - BlockedCidrs
+          - RateLimitPerFiveMinutes
+          - EnableBotControl
+          - EnableShieldAdvanced
+      - Label:
+          default: 'Deliverable D3.7 - Monitoring'
+        Parameters:
+          - LogRetentionInDays
+          - CpuAlarmThreshold
+          - MemoryAlarmThreshold
+          - DiskAlarmThreshold
+          - Alb5xxAlarmThreshold
+    ParameterLabels:
+      ServerName:
+        default: Short server name, unique per environment (e.g. wp01)
+      AvailabilityZone:
+        default: Compute Availability Zone - one of the two shared stack AZs
+      AmiId:
+        default: AMI to launch - the basic placeholder image now, the migrated AMI later
+      PlaceholderInstance:
+        default: "'true' while AmiId is the placeholder image; 'false' for the migrated AMI"
+      InstanceType:
+        default: Instance type - like-for-like with the source instance once migrated
+      CertificateArn:
+        default: ACM certificate ARN for the HTTPS listener (blank = HTTP only, for infrastructure testing)
+      WafRuleAction:
+        default: "WAF mode - 'count' for Customer testing, 'block' before cutover"
+      AdminAllowedCidrs:
+        default: Customer-approved public IP CIDRs allowed to reach wp-admin (comma-separated)
+
+Parameters:
+  ApplicationName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{1,24}$'
+    ConstraintDescription: 2-25 characters - lowercase letters, digits and hyphens, starting with a letter.
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, stage, prod]
+
+  ServerName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9]{1,9}$'
+    ConstraintDescription: 2-10 lowercase letters and digits, starting with a letter (e.g. wp01).
+
+  TemplateBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /EAS-IA/infrastructure/template-bucket
+
+  TemplatePrefix:
+    Type: String
+    Description: Injected by buildspec-create-changeset.yml - do not set it in the params file.
+
+  # ---------------------------------------------------------------- D3.2
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >-
+      Must be one of the two AZs in the shared stack's AvailabilityZones (the
+      ALB only routes to targets in its AZs) and have a Transit Gateway
+      attachment subnet (for egress). SoW default eu-west-2a.
+
+  AppSubnetCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: Within the VPC CIDR and not overlapping any other subnet.
+
+  DataSubnetCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: Reserved for future database externalisation - the database migrates on the AMI in this phase.
+
+  ReservedAppSubnetCidrSecondAz:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: Recorded in the stack outputs so the CIDR plan is held with the stack; not deployed in this phase.
+
+  ReservedDataSubnetCidrSecondAz:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: Recorded in the stack outputs so the CIDR plan is held with the stack; not deployed in this phase.
+
+  TargetPort:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    Description: Must match the shared stack's TargetPort (the public network ACL permits only that port to the VPC).
+
+  DbPort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: Customer to confirm (D3.2 prerequisite). 3306 for MySQL / MariaDB.
+
+  AlbIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(\d|[12]\d|3[0-2])$'
+    Description: The sites are public, so normally 0.0.0.0/0. wp-admin is restricted by AWS WAF instead.
+
+  # ---------------------------------------------------------------- D3.4
+  AmiId:
+    Type: String
+    AllowedPattern: '^ami-[0-9a-f]{8,17}$'
+    Description: >-
+      Until migration, a current Debian 12 AMI for this Region (see README). At
+      migration, the AMI copied into this account and encrypted with the
+      workload KMS key (D3.9 / D3.10). Changing it REPLACES the instance; the
+      previous instance is kept (stopped/terminated by hand once not needed).
+
+  PlaceholderInstance:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: >-
+      'true' adds user data that installs the SSM Agent and a placeholder web
+      page that passes the ALB health check, and leaves termination protection
+      off. Set 'false' together with the migrated AmiId - a migrated server must
+      not run the placeholder user data, and gets termination protection.
+
+  InstanceType:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]*\.[a-z0-9]+$'
+    Description: Like-for-like with the source instance (D3.4). Check the On-Demand vCPU quota first.
+
+  RootDeviceName:
+    Type: String
+    Default: /dev/xvda
+    Description: Root device name of the AMI (Debian AMIs use /dev/xvda) - its volume is encrypted with the workload KMS key.
+
+  RootVolumeSize:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Root volume size in GiB. 0 keeps the size of the AMI's root snapshot (use 0 for migrated AMIs).
+
+  RequireImdsv2:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Enforce IMDSv2. Set 'false' only if software on a migrated server still needs IMDSv1.
+
+  # ---------------------------------------------------------------- D3.3
+  CertificateArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws[a-z-]*:acm:[a-z0-9-]+:\d{12}:certificate/[0-9a-f-]+)?$'
+    Description: >-
+      Blank = HTTP listener forwarding to the instance (infrastructure testing
+      only). Set to the issued wildcard certificate (shared stack
+      CertificateArn output) to add HTTPS (TLS 1.2+) and redirect HTTP to it.
+
+  HealthCheckPath:
+    Type: String
+    Default: /
+  HealthCheckMatcher:
+    Type: String
+    Default: 200-399
+    Description: WordPress redirects requests that do not carry its site hostname, so 3xx counts as healthy.
+
+  # ---------------------------------------------------------------- D3.3 / D3.8
+  WafRuleAction:
+    Type: String
+    AllowedValues: [count, block]
+    Default: count
+    Description: Start in count mode for Customer testing; the Supplier switches to block before cutover (D3.3).
+
+  AdminAllowedCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Customer's approved public IPs (e.g. 203.0.113.10/32), used only by the
+      Customer (D3.8). Blank allow-list = wp-admin blocked for everyone in block mode.
+
+  BlockedCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Public IP CIDRs to deny entirely (optional).
+
+  RateLimitPerFiveMinutes:
+    Type: Number
+    Default: 2000
+    MinValue: 10
+    Description: Requests per source IP in any 5-minute window before AWS WAF blocks it.
+
+  EnableBotControl:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: AWS WAF Bot Control (common level) for bad-bot protection - has a monthly and per-request charge.
+
+  EnableShieldAdvanced:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: >-
+      Register the ALB with the Customer's existing Shield Advanced subscription
+      (SoW D3.3 assumes it is already active in this account - deployment fails if not).
+
+  # ---------------------------------------------------------------- D3.7
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  CpuAlarmThreshold:
+    Type: Number
+    Default: 80
+  MemoryAlarmThreshold:
+    Type: Number
+    Default: 85
+  DiskAlarmThreshold:
+    Type: Number
+    Default: 85
+  Alb5xxAlarmThreshold:
+    Type: Number
+    Default: 10
+
+# Nested stacks use DeletionPolicy RetainExceptOnCreate (Retain, except that a
+# stack whose first creation fails is cleaned up rather than orphaned holding
+# its subnet CIDRs). UpdateReplacePolicy has no such option and is Retain.
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-network.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        VpcId: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-VpcId'
+        VpcCidr: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-VpcCidr'
+        TransitGatewayId: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-TransitGatewayId'
+        PublicSubnetCidrA: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-PublicSubnetCidrA'
+        PublicSubnetCidrB: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-PublicSubnetCidrB'
+        AvailabilityZone: !Ref AvailabilityZone
+        AppSubnetCidr: !Ref AppSubnetCidr
+        DataSubnetCidr: !Ref DataSubnetCidr
+        TargetPort: !Ref TargetPort
+        DbPort: !Ref DbPort
+      Tags:
+        - Key: Deliverable
+          Value: D3.2
+
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-security.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        VpcId: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-VpcId'
+        AppSubnetCidr: !Ref AppSubnetCidr
+        DataSubnetCidr: !Ref DataSubnetCidr
+        TargetPort: !Ref TargetPort
+        DbPort: !Ref DbPort
+        AlbIngressCidr: !Ref AlbIngressCidr
+      Tags:
+        - Key: Deliverable
+          Value: D3.2-D3.6
+
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-compute.yml'
+      TimeoutInMinutes: 30
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        AppSubnetId: !GetAtt NetworkStack.Outputs.AppSubnetId
+        Ec2SecurityGroupId: !GetAtt SecurityStack.Outputs.Ec2SecurityGroupId
+        KmsKeyArn: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-KmsKeyArn'
+        AmiId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        RootDeviceName: !Ref RootDeviceName
+        RootVolumeSize: !Ref RootVolumeSize
+        PlaceholderInstance: !Ref PlaceholderInstance
+        RequireImdsv2: !Ref RequireImdsv2
+        TargetPort: !Ref TargetPort
+        PrivateHostedZoneId: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-PrivateHostedZoneId'
+        PrivateHostedZoneName: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-PrivateHostedZoneName'
+      Tags:
+        - Key: Deliverable
+          Value: D3.4-D3.6
+
+  AlbStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-alb.yml'
+      TimeoutInMinutes: 20
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        VpcId: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-VpcId'
+        PublicSubnetIds: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-PublicSubnetIds'
+        AlbSecurityGroupId: !GetAtt SecurityStack.Outputs.AlbSecurityGroupId
+        InstanceId: !GetAtt ComputeStack.Outputs.InstanceId
+        TargetPort: !Ref TargetPort
+        HealthCheckPath: !Ref HealthCheckPath
+        HealthCheckMatcher: !Ref HealthCheckMatcher
+        CertificateArn: !Ref CertificateArn
+      Tags:
+        - Key: Deliverable
+          Value: D3.3
+
+  WafStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-waf.yml'
+      TimeoutInMinutes: 20
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        LoadBalancerArn: !GetAtt AlbStack.Outputs.LoadBalancerArn
+        KmsKeyArn: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-KmsKeyArn'
+        RuleAction: !Ref WafRuleAction
+        AdminAllowedCidrs: !Join [',', !Ref AdminAllowedCidrs]
+        BlockedCidrs: !Join [',', !Ref BlockedCidrs]
+        RateLimitPerFiveMinutes: !Ref RateLimitPerFiveMinutes
+        EnableBotControl: !Ref EnableBotControl
+        EnableShieldAdvanced: !Ref EnableShieldAdvanced
+      Tags:
+        - Key: Deliverable
+          Value: D3.3-D3.8
+
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}/server-monitoring.yml'
+      TimeoutInMinutes: 15
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        Environment: !Ref Environment
+        ServerName: !Ref ServerName
+        InstanceId: !GetAtt ComputeStack.Outputs.InstanceId
+        LoadBalancerFullName: !GetAtt AlbStack.Outputs.LoadBalancerFullName
+        TargetGroupFullName: !GetAtt AlbStack.Outputs.TargetGroupFullName
+        AlarmTopicArn: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-AlarmTopicArn'
+        KmsKeyArn: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-KmsKeyArn'
+        CloudWatchAgentDocumentName: !ImportValue
+          Fn::Sub: '${ApplicationName}-${Environment}-shared-CloudWatchAgentDocumentName'
+        LogRetentionInDays: !Ref LogRetentionInDays
+        CpuAlarmThreshold: !Ref CpuAlarmThreshold
+        MemoryAlarmThreshold: !Ref MemoryAlarmThreshold
+        DiskAlarmThreshold: !Ref DiskAlarmThreshold
+        Alb5xxAlarmThreshold: !Ref Alb5xxAlarmThreshold
+      Tags:
+        - Key: Deliverable
+          Value: D3.7
+
+Outputs:
+  LoadBalancerDnsName:
+    Description: Give this to the Customer for the per-site DNS change at cutover (CNAME/alias)
+    Value: !GetAtt AlbStack.Outputs.LoadBalancerDnsName
+  InstanceId:
+    Value: !GetAtt ComputeStack.Outputs.InstanceId
+  InstanceDnsName:
+    Value: !GetAtt ComputeStack.Outputs.InstanceDnsName
+  WordPressSecretArn:
+    Value: !GetAtt ComputeStack.Outputs.WordPressSecretArn
+  WebAclArn:
+    Value: !GetAtt WafStack.Outputs.WebAclArn
+  DashboardName:
+    Value: !GetAtt MonitoringStack.Outputs.DashboardName
+  AppSubnetId:
+    Value: !GetAtt NetworkStack.Outputs.AppSubnetId
+  DataSubnetId:
+    Value: !GetAtt NetworkStack.Outputs.DataSubnetId
+  AppNetworkAclId:
+    Value: !GetAtt NetworkStack.Outputs.AppNetworkAclId
+  DataNetworkAclId:
+    Value: !GetAtt NetworkStack.Outputs.DataNetworkAclId
+  AlbSecurityGroupId:
+    Value: !GetAtt SecurityStack.Outputs.AlbSecurityGroupId
+  Ec2SecurityGroupId:
+    Value: !GetAtt SecurityStack.Outputs.Ec2SecurityGroupId
+  DbSecurityGroupId:
+    Value: !GetAtt SecurityStack.Outputs.DbSecurityGroupId
+  ReservedSecondAzCidrs:
+    Description: App and Data CIDRs held for this server in the second AZ (future multi-AZ phase)
+    Value: !Join [',', [!Ref ReservedAppSubnetCidrSecondAz, !Ref ReservedDataSubnetCidrSecondAz]]

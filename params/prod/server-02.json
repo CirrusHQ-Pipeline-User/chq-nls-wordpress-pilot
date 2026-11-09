@@ -1,0 +1,42 @@
+{
+  "Template": "server.yml",
+  "Parameters": {
+    "ApplicationName": "nls-wordpress",
+    "Environment": "prod",
+    "ServerName": "wp02",
+    "AvailabilityZone": "eu-west-2a",
+    "AppSubnetCidr": "10.149.13.128/27",
+    "DataSubnetCidr": "10.149.13.160/27",
+    "ReservedAppSubnetCidrSecondAz": "10.149.13.192/27",
+    "ReservedDataSubnetCidrSecondAz": "10.149.13.224/27",
+    "TargetPort": "80",
+    "DbPort": "3306",
+    "AlbIngressCidr": "0.0.0.0/0",
+    "AmiId": "Update",
+    "PlaceholderInstance": "true",
+    "InstanceType": "t3.small",
+    "RootDeviceName": "/dev/xvda",
+    "RootVolumeSize": "0",
+    "RequireImdsv2": "true",
+    "CertificateArn": "",
+    "HealthCheckPath": "/",
+    "HealthCheckMatcher": "200-399",
+    "WafRuleAction": "count",
+    "AdminAllowedCidrs": "",
+    "BlockedCidrs": "",
+    "RateLimitPerFiveMinutes": "2000",
+    "EnableBotControl": "true",
+    "EnableShieldAdvanced": "true",
+    "LogRetentionInDays": "30",
+    "CpuAlarmThreshold": "80",
+    "MemoryAlarmThreshold": "85",
+    "DiskAlarmThreshold": "85",
+    "Alb5xxAlarmThreshold": "10"
+  },
+  "Tags": {
+    "Environment": "prod",
+    "ApplicationName": "nls-wordpress",
+    "aws-apn-id": "pc:6riim3fafb0fpeqecyjw2qmwo",
+    "WordPressServer": "wp02"
+  }
+}

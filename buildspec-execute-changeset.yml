@@ -1,0 +1,78 @@
+version: 0.2
+
+# Executes the change sets created by buildspec-create-changeset.yml for the
+# same PARAM_FILES, one stack at a time in file order, waiting for each to
+# finish before starting the next.
+#
+# Environment: ENVIRONMENT, STACK_PREFIX, PARAM_FILES, TERMINATION_PROTECTION
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        shopt -s nullglob
+
+        # Split PARAM_FILES into patterns without expanding them against the
+        # repo root, then expand each one inside params/$ENVIRONMENT.
+        set -f; PATTERNS=($PARAM_FILES); set +f
+        FILES=()
+        for pattern in "${PATTERNS[@]}"; do
+          for f in params/"$ENVIRONMENT"/$pattern; do FILES+=("$f"); done
+        done
+        if [ ${#FILES[@]} -eq 0 ]; then
+          echo "No parameter files match '$PARAM_FILES' in params/$ENVIRONMENT - nothing to execute"
+          exit 1
+        fi
+
+        for PARAM_FILE in "${FILES[@]}"; do
+          STACK_NAME="${STACK_PREFIX}-$(basename "$PARAM_FILE" .json)"
+          CHANGE_SET_NAME="$STACK_NAME"
+          echo "================ $STACK_NAME"
+
+          if ! EXECUTION_STATUS=$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+              --change-set-name "$CHANGE_SET_NAME" --query ExecutionStatus --output text 2>/dev/null); then
+            echo "No change set to execute - the create step found nothing to change"
+          elif [ "$EXECUTION_STATUS" != AVAILABLE ]; then
+            echo "Change set $CHANGE_SET_NAME is $EXECUTION_STATUS, not AVAILABLE - refusing to execute"
+            exit 1
+          else
+            echo "Executing change set $CHANGE_SET_NAME on $STACK_NAME"
+            aws cloudformation execute-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGE_SET_NAME"
+
+            sleep 15
+            while true; do
+              STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+                --query 'Stacks[0].StackStatus' --output text)
+              case "$STATUS" in
+                CREATE_COMPLETE|UPDATE_COMPLETE)
+                  echo "$STACK_NAME: $STATUS"
+                  break
+                  ;;
+                *_IN_PROGRESS)
+                  echo "$STACK_NAME: $STATUS"
+                  sleep 30
+                  ;;
+                *)
+                  echo "$STACK_NAME finished in $STATUS. Failed resources:"
+                  aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --max-items 100 \
+                    --query "StackEvents[?ends_with(ResourceStatus, 'FAILED')].[Timestamp,LogicalResourceId,ResourceStatusReason]" \
+                    --output table
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+
+          # Production stacks carry termination protection, re-applied on every
+          # run. Set on the root stack - nested stacks take it from their root.
+          if [ "${TERMINATION_PROTECTION:-false}" = true ]; then
+            aws cloudformation update-termination-protection --enable-termination-protection \
+              --stack-name "$STACK_NAME" > /dev/null
+            echo "$STACK_NAME: termination protection $(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].EnableTerminationProtection' --output text)"
+          fi
+        done

@@ -1,0 +1,35 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - internal DNS (nested in shared.yml, Deliverable D3.3). One
+  Route 53 private hosted zone associated with the WordPress VPC. Public DNS
+  for the sites stays on the Customer's external DNS platform.
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateHostedZoneName:
+    Type: String
+
+Resources:
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref PrivateHostedZoneName
+      HostedZoneConfig:
+        Comment: !Sub '${ApplicationName} ${Environment} internal names (WordPress VPC only)'
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-zone'
+
+Outputs:
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone
+  PrivateHostedZoneName:
+    Value: !Ref PrivateHostedZoneName

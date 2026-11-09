@@ -1,0 +1,18 @@
+let alarms = Resources.*[ Type == 'AWS::CloudWatch::Alarm' ]
+
+# D3.7 - every alarm has an action (the shared SNS topic)
+rule alarms_notify_topic {
+    %alarms !empty
+    %alarms.Properties.AlarmActions exists
+}
+
+# D3.7 - the agent configuration is readable by CloudWatchAgentServerPolicy
+rule agent_config_parameter_prefix {
+    Resources.CloudWatchAgentConfig.Properties.Name.'Fn::Sub' == /^AmazonCloudWatch-/
+}
+
+# D3.7 - a dashboard and the agent association exist
+rule dashboard_and_agent_association_present {
+    Resources.*[ Type == 'AWS::CloudWatch::Dashboard' ] !empty
+    Resources.*[ Type == 'AWS::SSM::Association' ] !empty
+}

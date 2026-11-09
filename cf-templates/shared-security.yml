@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NLS WordPress - shared security and operations resources (nested in
+  shared.yml). The customer managed KMS key (D3.6) used for EBS, Secrets
+  Manager, CloudWatch Logs and SNS; the critical-alarm SNS topic (D3.7); and the
+  SSM document that installs and configures the CloudWatch agent (D3.7).
+
+Parameters:
+  ApplicationName:
+    Type: String
+  Environment:
+    Type: String
+  AlarmEmailAddress:
+    Type: String
+    Default: ''
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmailAddress, '']]
+
+Resources:
+  # ------------------------------------------------------------------ KMS (D3.6)
+  WorkloadKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ApplicationName} ${Environment} CMK - EBS volumes, AMI copies, Secrets Manager, CloudWatch Logs, SNS'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # IAM policies in this account govern use of the key (EC2/EBS,
+          # Secrets Manager and the CloudFormation deployment role).
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsToUseKey
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: AllowCloudWatchAlarmsToPublishToEncryptedTopic
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  WorkloadKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ApplicationName}-${Environment}'
+      TargetKeyId: !Ref WorkloadKey
+
+  # ------------------------------------------------------------------ Alarm notifications (D3.7)
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-alarms'
+      DisplayName: !Sub '${ApplicationName} ${Environment} alarms'
+      KmsMasterKeyId: !Ref WorkloadKey
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # The recipient must confirm the subscription from the email AWS sends.
+  # Further addresses can be added the same way or subscribed in the console.
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmailAddress
+
+  # ------------------------------------------------------------------ CloudWatch agent (D3.7)
+  # Installs the agent through Distributor, then loads the configuration held
+  # in the SSM parameter named by ConfigParameterName. Each server stack
+  # associates this document with its instance, so it runs as soon as the
+  # instance registers with Systems Manager - placeholder or migrated.
+  # UpdateMethod NewVersion keeps the document name (an export) stable.
+  CloudWatchAgentDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: '2.2'
+        description: Install the Amazon CloudWatch agent and apply its configuration from an SSM parameter.
+        parameters:
+          ConfigParameterName:
+            type: String
+            description: SSM parameter holding the agent configuration (must start with AmazonCloudWatch-)
+        mainSteps:
+          - action: aws:runDocument
+            name: InstallCloudWatchAgent
+            inputs:
+              documentType: SSMDocument
+              documentPath: AWS-ConfigureAWSPackage
+              documentParameters: '{"action":"Install","name":"AmazonCloudWatchAgent"}'
+          - action: aws:runDocument
+            name: ConfigureCloudWatchAgent
+            inputs:
+              documentType: SSMDocument
+              documentPath: AmazonCloudWatch-ManageAgent
+              documentParameters: '{"action":"configure","mode":"ec2","optionalConfigurationSource":"ssm","optionalConfigurationLocation":"{{ ConfigParameterName }}","optionalRestart":"yes"}'
+      Tags:
+        - Key: Deliverable
+          Value: D3.7
+
+Outputs:
+  KmsKeyArn:
+    Value: !GetAtt WorkloadKey.Arn
+  KmsKeyAlias:
+    Value: !Ref WorkloadKeyAlias
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  CloudWatchAgentDocumentName:
+    Value: !Ref CloudWatchAgentDocument

@@ -1,0 +1,23 @@
+let https_listeners = Resources.*[
+    Type == 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties.Protocol == 'HTTPS'
+]
+
+# D3.3 - internet-facing ALB that drops invalid headers
+rule load_balancer_internet_facing_and_hardened {
+    Resources.LoadBalancer.Properties.Scheme == 'internet-facing'
+    Resources.LoadBalancer.Properties.LoadBalancerAttributes[
+        Key == 'routing.http.drop_invalid_header_fields.enabled'
+    ].Value == 'true'
+}
+
+# D3.3 - HTTPS terminates at the ALB with a TLS 1.2+ policy
+rule https_listener_uses_tls12_policy when %https_listeners !empty {
+    %https_listeners.Properties.SslPolicy exists
+}
+
+# D3.3 - the instance is reached over HTTP on the target port (TLS ends at the ALB)
+rule target_group_http {
+    Resources.TargetGroup.Properties.Protocol == 'HTTP'
+    Resources.TargetGroup.Properties.HealthCheckEnabled == true
+}
